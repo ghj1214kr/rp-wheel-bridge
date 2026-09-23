@@ -353,6 +353,10 @@ impl Handler for Control {
         log::info!("PS device: configured = {}", configured);
     }
 
+    fn suspended(&mut self, suspended: bool) {
+        log::info!("PS device: suspended = {}", suspended);
+    }
+
     fn control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
         if req.recipient != Recipient::Interface {
             return None;

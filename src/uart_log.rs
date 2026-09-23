@@ -1,4 +1,5 @@
-//! `log` output on UART0: GPIO0 TX, GPIO1 RX, 921600 8N1.
+//! `log` output on UART0: GPIO0 TX, GPIO1 RX, 921600 8N1. Each line starts with the
+//! uptime in seconds.
 //!
 //! Both cores log. Each record is formatted on the logging core and put into a pipe
 //! whole or not at all, so lines from the two cores never interleave; [`task`] (core 0)
@@ -17,6 +18,7 @@ use embassy_rp::peripherals::{PIN_0, PIN_1, UART0};
 use embassy_rp::uart::{self, BufferedInterruptHandler, BufferedUart};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pipe::Pipe;
+use embassy_time::Instant;
 use embedded_io_async::Write as _;
 use log::{LevelFilter, Log, Metadata, Record};
 use static_cell::StaticCell;
@@ -25,9 +27,10 @@ pub const BAUDRATE: u32 = 921_600;
 
 const LEVEL: LevelFilter = LevelFilter::Debug;
 
-/// Log bytes buffered between the logging cores and the UART. Sized for the bursty
-/// descriptor dump.
-const PIPE_LEN: usize = 4096;
+/// Log bytes buffered between the logging cores and the UART. Sized for bursts: the
+/// descriptor dump, and G HUB's HID++ start-up exchange (several hundred messages in a
+/// few seconds, more than 921600 baud drains).
+const PIPE_LEN: usize = 16384;
 
 /// Longest formatted record; longer ones are truncated. Fits a 64-byte report in hex
 /// with its prefix.
@@ -92,7 +95,8 @@ impl Log for UartLogger {
 
     fn log(&self, record: &Record) {
         let mut line = LineBuf::<LINE_LEN>::new();
-        let _ = write!(line, "{}", record.args());
+        let ms = Instant::now().as_millis();
+        let _ = write!(line, "{:5}.{:03} {}", ms / 1000, ms % 1000, record.args());
         line.end_line();
 
         // One critical section (both cores) for the capacity check and the writes.

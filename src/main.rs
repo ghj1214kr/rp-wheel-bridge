@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod ghub_init;
 mod hid;
 mod input_map;
 mod proxy;
