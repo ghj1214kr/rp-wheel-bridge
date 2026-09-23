@@ -36,6 +36,26 @@ embassy-usb = {
 
 embassy-usb-logger = "0.6.0"
 
+# USB host on the USB-A port (PIO USB, GPIO12/GPIO13).
+# Versions pinned to the same Embassy release line as embassy-rp 0.10 / embassy-usb 0.6.
+rp-pio-usb-host = {
+    version = "0.1.0",
+    features = ["rp235xa"]
+}
+
+# `log` (not `defmt`) so the host stack's own warnings go to the USB CDC logger.
+embassy-usb-host = {
+    version = "0.1.0",
+    features = ["log"]
+}
+
+embassy-usb-driver = "0.2.2"
+
+# Already in the tree via embassy-usb; used directly for select/join.
+embassy-futures = "0.1.2"
+
+static_cell = "2.1.1"
+
 cortex-m = {
     version = "0.7.9",
     features = ["inline-asm"]
