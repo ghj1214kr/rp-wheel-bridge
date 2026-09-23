@@ -1287,8 +1287,7 @@ dependencies = [
 [[package]]
 name = "rp-pio-usb-host"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cca56a3d53428c51a627207d36f6a47a69bc656149a8d41c735f8f7d0199543"
+source = "git+https://github.com/ghj1214kr/rp-pio-usb-host?rev=592348c6e04b1613b17bc144551e3ae8810e88c4#592348c6e04b1613b17bc144551e3ae8810e88c4"
 dependencies = [
  "critical-section",
  "embassy-rp",

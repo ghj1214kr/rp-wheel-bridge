@@ -90,3 +90,8 @@ opt-level = 0
 [profile.release.build-override]
 debug = false
 opt-level = 0
+
+# Fork of rp-pio-usb-host (branch sof-during-transfers): hardware-timed SOF, SOFs during
+# transfers, stage-by-stage control transfers.
+[patch.crates-io]
+rp-pio-usb-host = { git = "https://github.com/ghj1214kr/rp-pio-usb-host", rev = "592348c6e04b1613b17bc144551e3ae8810e88c4" }

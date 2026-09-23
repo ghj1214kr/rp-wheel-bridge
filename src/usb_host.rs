@@ -12,8 +12,17 @@
 //! then reset the RP2350.
 //!
 //! Scope: one full-speed device directly on the port. No hub, no hot-plug requirement.
+//!
+//! SOFs: the G Pro powers off about a second after SET_CONFIGURATION unless the SOF
+//! period is steady (USB 2.0 §7.1.12: 1.000 ms ± 0.5 µs); SOFs sent by an interrupt
+//! were tens to hundreds of microseconds late. The binary therefore enables the fork's
+//! hardware SOF (`Bus::enable_hw_sof`: a PWM wrap triggers a DMA write that starts a
+//! pre-loaded PIO state machine), and the frame-timer interrupt only prepares the next
+//! SOF.
 
 use core::fmt;
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
@@ -57,7 +66,13 @@ const DESC_TYPE_STRING: u8 = 0x03;
 const DESC_TYPE_HID: u8 = 0x21;
 const CLASS_HUB: u8 = 0x09;
 
-/// Claim PIO0 + GPIO12/13 for the USB host bus.
+/// Bus served by the frame-timer interrupt (set once by [`init`]).
+static FRAME_TIMER_BUS: AtomicPtr<Bus<'static, PIO0>> = AtomicPtr::new(ptr::null_mut());
+
+/// Claim PIO0 + GPIO12/13 for the USB host bus and start its frame timer.
+///
+/// Call on the core that runs the host: the frame-timer interrupt (`TIMER0_IRQ_1`) is
+/// enabled there, and the binary must route it to [`on_frame_timer_irq`].
 pub fn init(
     pio: Peri<'static, PIO0>,
     dp: Peri<'static, PIN_12>,
@@ -65,7 +80,19 @@ pub fn init(
     irq: impl Binding<PIO0_IRQ_0, InterruptHandler<PIO0>>,
 ) -> &'static Bus<'static, PIO0> {
     static BUS: StaticCell<Bus<'static, PIO0>> = StaticCell::new();
-    BUS.init(Bus::new(pio, dp, dm, irq, Pulldown::Internal))
+    let bus = BUS.init(Bus::new(pio, dp, dm, irq, Pulldown::Internal));
+    FRAME_TIMER_BUS.store(ptr::from_ref(bus).cast_mut(), Ordering::Release);
+    bus.start_frame_timer();
+    bus
+}
+
+/// Body of the 1 ms frame-timer interrupt.
+pub fn on_frame_timer_irq() {
+    let bus = FRAME_TIMER_BUS.load(Ordering::Acquire);
+    // SAFETY: set once from a `&'static Bus` before the interrupt is enabled.
+    if let Some(bus) = unsafe { bus.as_ref() } {
+        bus.on_frame_timer();
+    }
 }
 
 /// Sends full-speed SOFs every 1 ms between transfers. Must run for the device to stay
