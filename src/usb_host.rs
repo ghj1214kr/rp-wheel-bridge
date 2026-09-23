@@ -43,7 +43,7 @@ use embassy_usb_host::{BusRoute, BusState, EnumerationError};
 use rp_pio_usb_host::{Bus, PioPipe, PioUsbAllocator, PioUsbController, Pulldown};
 use static_cell::StaticCell;
 
-use crate::hid;
+use crate::{hid, proxy};
 
 type HostController =
     embassy_usb_host::BusController<'static, PioUsbController<'static, 'static, PIO0>>;
@@ -103,8 +103,9 @@ pub async fn idle_task(bus: &'static Bus<'static, PIO0>) {
     bus.idle_task().await;
 }
 
-/// Waits for a device, enumerates it, logs its descriptors, then probes its HID
-/// interfaces and logs input reports until it detaches.
+/// Waits for a device, enumerates it, logs its descriptors and probes its HID
+/// interfaces. The G Pro (c272) is then forwarded to the PS device; any other device's
+/// input reports are logged. Runs until the device detaches.
 #[embassy_executor::task]
 pub async fn host_task(bus: &'static Bus<'static, PIO0>) {
     static BUS_STATE: BusState = BusState::new();
@@ -131,15 +132,20 @@ pub async fn host_task(bus: &'static Bus<'static, PIO0>) {
         let ifaces = hid::find_interfaces(&config_buf[..config_len]);
         hid::probe(&bus, &info, &ifaces).await;
 
-        log::info!("monitoring HID input reports (changes only)...");
+        let d = &info.device_desc;
+        let is_wheel = (d.vendor_id, d.product_id) == (proxy::WHEEL_VID, proxy::WHEEL_PID);
+        let serve = async {
+            if is_wheel {
+                proxy::run(&bus, &info, &ifaces).await;
+                log::warn!("proxy stopped");
+            } else {
+                log::info!("monitoring HID input reports (changes only)...");
+                hid::monitor(&bus, &info, &ifaces).await;
+                log::warn!("all HID monitors stopped");
+            }
+        };
         // With R13 fitted a detach is never seen, so this runs until reset.
-        if let Either::First(()) = select(
-            hid::monitor(&bus, &info, &ifaces),
-            wait_for_disconnect(&mut ctrl),
-        )
-        .await
-        {
-            log::warn!("all HID monitors stopped");
+        if let Either::First(()) = select(serve, wait_for_disconnect(&mut ctrl)).await {
             wait_for_disconnect(&mut ctrl).await;
         }
         log::info!("USB device disconnected");

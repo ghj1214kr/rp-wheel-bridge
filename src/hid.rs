@@ -488,7 +488,7 @@ fn log_report_summary(desc: &[u8]) -> [Option<ReportSize>; MAX_REPORTS] {
 }
 
 /// Space-separated lowercase hex bytes.
-struct Hex<'a>(&'a [u8]);
+pub struct Hex<'a>(pub &'a [u8]);
 
 impl fmt::Display for Hex<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

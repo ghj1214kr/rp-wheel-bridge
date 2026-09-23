@@ -2,6 +2,9 @@
 #![no_main]
 
 mod hid;
+mod input_map;
+mod proxy;
+mod ps_device;
 mod uart_log;
 mod usb_host;
 
@@ -12,13 +15,14 @@ use embassy_executor::Spawner;
 use embassy_rp::clocks::{ClockConfig, CoreVoltage};
 use embassy_rp::executor::Executor;
 use embassy_rp::multicore::{Stack, spawn_core1};
-use embassy_rp::peripherals::{PIO0, UART0};
+use embassy_rp::peripherals::{PIO0, UART0, USB};
 use embassy_rp::{bind_interrupts, interrupt};
 use embassy_time::Timer;
 use panic_probe as _;
 use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
     UART0_IRQ => embassy_rp::uart::BufferedInterruptHandler<UART0>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
 });
@@ -40,7 +44,7 @@ fn TIMER0_IRQ_1() {
     usb_host::on_frame_timer_irq();
 }
 
-/// Core 0: UART logger (native USB: PS5 device later).
+/// Core 0: UART logger and the PS device on native USB.
 /// Core 1: PIO USB host only, so its timing-critical transactions never share an
 /// executor or interrupts with the native USB stack.
 #[embassy_executor::main(
@@ -64,6 +68,8 @@ async fn main(spawner: Spawner) {
         "UART logger initialized (UART0, TX=GPIO0, RX=GPIO1, {} 8N1)",
         uart_log::BAUDRATE
     );
+
+    spawner.spawn(ps_device::task(embassy_rp::usb::Driver::new(p.USB, Irqs)).unwrap());
 
     let (pio, dp, dm) = (p.PIO0, p.PIN_12, p.PIN_13);
     let (sof_pwm, sof_dma) = (p.PWM_SLICE7, p.DMA_CH10);
