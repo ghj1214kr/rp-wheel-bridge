@@ -34,7 +34,10 @@ embassy-usb = {
     features = ["defmt"]
 }
 
-embassy-usb-logger = "0.6.0"
+# Log output on UART0 (src/uart_log.rs).
+embassy-sync = "0.8.0"
+embedded-io-async = "0.7.0"
+critical-section = "1.2.0"
 
 # USB host on the USB-A port (PIO USB, GPIO12/GPIO13).
 # Versions pinned to the same Embassy release line as embassy-rp 0.10 / embassy-usb 0.6.

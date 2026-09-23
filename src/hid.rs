@@ -39,7 +39,7 @@ const REPORT_LOG_INTERVAL: Duration = Duration::from_millis(100);
 /// Report-rate statistics period.
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Pause after a large log burst so the CDC logger pipe can drain (it drops on full).
+/// Pause after a large log burst so the logger pipe can drain (it drops on full).
 const LOG_DRAIN: Duration = Duration::from_millis(50);
 
 const CLASS_HID: u8 = 0x03;

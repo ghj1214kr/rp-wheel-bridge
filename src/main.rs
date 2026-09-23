@@ -2,6 +2,7 @@
 #![no_main]
 
 mod hid;
+mod uart_log;
 mod usb_host;
 
 use core::ptr::addr_of_mut;
@@ -11,15 +12,14 @@ use embassy_executor::Spawner;
 use embassy_rp::clocks::{ClockConfig, CoreVoltage};
 use embassy_rp::executor::Executor;
 use embassy_rp::multicore::{Stack, spawn_core1};
-use embassy_rp::peripherals::{PIO0, USB};
-use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_rp::peripherals::{PIO0, UART0};
 use embassy_rp::{bind_interrupts, interrupt};
 use embassy_time::Timer;
 use panic_probe as _;
 use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs {
-    USBCTRL_IRQ => InterruptHandler<USB>;
+    UART0_IRQ => embassy_rp::uart::BufferedInterruptHandler<UART0>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
 });
 
@@ -31,19 +31,8 @@ bind_interrupts!(struct Irqs {
 const SYS_CLOCK_HZ: u32 = 192_000_000;
 const CORE_VOLTAGE: CoreVoltage = CoreVoltage::V1_15;
 
-/// Time for the PC to re-enumerate the CDC logger after a reset, so the serial monitor
-/// can reattach before the USB host starts logging.
-const BOOT_LOG_DELAY_MS: u64 = 2000;
-
 static mut CORE1_STACK: Stack<16384> = Stack::new();
 static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
-
-#[embassy_executor::task]
-async fn logger_task(driver: Driver<'static, USB>) {
-    // Larger than the usual 2048: the descriptor dump is bursty and is buffered
-    // until the serial monitor is attached.
-    embassy_usb_logger::run!(4096, log::LevelFilter::Debug, driver);
-}
 
 /// USB host frame timer (TIMER0 alarm 1), enabled on core 1 by `usb_host::init`.
 #[interrupt]
@@ -51,7 +40,7 @@ fn TIMER0_IRQ_1() {
     usb_host::on_frame_timer_irq();
 }
 
-/// Core 0: native USB (CDC logger now, PS5 device later).
+/// Core 0: UART logger (native USB: PS5 device later).
 /// Core 1: PIO USB host only, so its timing-critical transactions never share an
 /// executor or interrupts with the native USB stack.
 #[embassy_executor::main(
@@ -64,19 +53,17 @@ async fn main(spawner: Spawner) {
     clocks.core_voltage = CORE_VOLTAGE;
     let p = embassy_rp::init(embassy_rp::config::Config::new(clocks));
 
-    let usb_driver = Driver::new(p.USB, Irqs);
-
-    spawner.spawn(logger_task(usb_driver).unwrap());
-
-    // The logger is installed when logger_task first runs; anything logged before
-    // this await would be dropped.
-    Timer::after_millis(BOOT_LOG_DELAY_MS).await;
+    let log_uart = uart_log::init(p.UART0, p.PIN_0, p.PIN_1, Irqs);
+    spawner.spawn(uart_log::task(log_uart).unwrap());
 
     log::info!(
         "rp-wheel-bridge boot (clk_sys {} Hz)",
         embassy_rp::clocks::clk_sys_freq()
     );
-    log::info!("native USB logger initialized");
+    log::info!(
+        "UART logger initialized (UART0, TX=GPIO0, RX=GPIO1, {} 8N1)",
+        uart_log::BAUDRATE
+    );
 
     let (pio, dp, dm) = (p.PIO0, p.PIN_12, p.PIN_13);
     let (sof_pwm, sof_dma) = (p.PWM_SLICE7, p.DMA_CH10);
