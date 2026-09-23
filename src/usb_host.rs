@@ -51,7 +51,8 @@ pub type HostBus = embassy_usb_host::BusHandle<'static, PioUsbAllocator<'static,
 pub type ControlPipe = PioPipe<'static, 'static, pipe::Control, pipe::InOut, PIO0>;
 
 /// Enumeration attempts per attach before giving up (each retry re-resets the port).
-const ENUM_ATTEMPTS: u32 = 3;
+/// DriveHub needs a few seconds after power-up and has taken 3.
+const ENUM_ATTEMPTS: u32 = 6;
 
 /// Room for the full configuration descriptor. Typical HID devices need < 100 bytes.
 const CONFIG_BUF_LEN: usize = 512;

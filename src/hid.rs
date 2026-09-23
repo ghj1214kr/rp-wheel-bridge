@@ -1,7 +1,7 @@
 //! Generic HID probing for the device on the USB-A host port.
 //!
-//! Dumps each HID interface's report descriptor (hex + per-report size summary) and
-//! logs raw input reports from every interrupt IN endpoint.
+//! Dumps each HID interface's report descriptor (hex + per-report size summary), reads
+//! its feature reports, and logs raw input reports from every interrupt IN endpoint.
 //!
 //! Done here rather than with `embassy_usb_host::class::hid` because:
 //! - `HidHost::new` only binds the *first* HID interface (`find_hid`), and the G Pro
@@ -21,7 +21,7 @@ use embassy_usb_host::descriptor::{
 };
 use embassy_usb_host::handler::EnumerationInfo;
 
-use crate::usb_host::{HostBus, open_ep0};
+use crate::usb_host::{ControlPipe, HostBus, open_ep0};
 
 /// HID interfaces tracked per device (the G Pro has 3).
 pub const MAX_HID_INTERFACES: usize = 4;
@@ -42,10 +42,22 @@ const STATS_INTERVAL: Duration = Duration::from_secs(5);
 /// Pause after a large log burst so the logger pipe can drain (it drops on full).
 const LOG_DRAIN: Duration = Duration::from_millis(50);
 
+/// Largest feature report read (plus its ID byte); longer ones are truncated.
+const FEATURE_BUF_LEN: usize = 256;
+
+/// Usage page of the PlayStation authentication reports (F0..F3). Not read: a GET_REPORT
+/// there can change the device's auth state.
+const USAGE_PAGE_PS_AUTH: u16 = 0xfff0;
+
+/// (report ID, type) pairs tracked per report descriptor.
+const MAX_REPORTS: usize = 24;
+
 const CLASS_HID: u8 = 0x03;
 const DESC_TYPE_HID: u8 = 0x21;
 const DESC_TYPE_REPORT: u8 = 0x22;
+const HID_REQ_GET_REPORT: u8 = 0x01;
 const HID_REQ_SET_IDLE: u8 = 0x0a;
+const HID_REPORT_TYPE_FEATURE: u16 = 0x03;
 
 #[derive(Clone, Copy)]
 pub struct HidInterface {
@@ -135,7 +147,8 @@ impl<'a> DescriptorVisitor<'a> for HidFinder {
     }
 }
 
-/// Fetch and log each interface's report descriptor, then SET_IDLE(0) it.
+/// Fetch and log each interface's report descriptor and feature reports, then
+/// SET_IDLE(0) it.
 pub async fn probe(bus: &HostBus, info: &EnumerationInfo, ifaces: &[Option<HidInterface>]) {
     let mut ep0 = match open_ep0(bus, info) {
         Ok(p) => p,
@@ -162,7 +175,9 @@ pub async fn probe(bus: &HostBus, info: &EnumerationInfo, ifaces: &[Option<HidIn
             Ok(n) => {
                 log_hex_dump(&buf[..n]);
                 Timer::after(LOG_DRAIN).await;
-                log_report_summary(&buf[..n]);
+                let reports = log_report_summary(&buf[..n]);
+                Timer::after(LOG_DRAIN).await;
+                read_feature_reports(&mut ep0, iface.number, &reports).await;
             }
             Err(e) => log::warn!("  GET_DESCRIPTOR(report) failed: {:?}", e),
         }
@@ -177,6 +192,42 @@ pub async fn probe(bus: &HostBus, info: &EnumerationInfo, ifaces: &[Option<HidIn
             Err(e) => log::warn!("  SET_IDLE failed: {:?}", e),
         }
 
+        Timer::after(LOG_DRAIN).await;
+    }
+}
+
+/// GET_REPORT(Feature) every feature report with a report ID, except the auth reports,
+/// and log its contents.
+async fn read_feature_reports(
+    ep0: &mut ControlPipe,
+    iface: u8,
+    reports: &[Option<ReportSize>; MAX_REPORTS],
+) {
+    let mut buf = [0u8; FEATURE_BUF_LEN];
+    let features = reports
+        .iter()
+        .flatten()
+        .filter(|r| r.kind == ReportKind::Feature && r.id != 0);
+    for r in features {
+        if r.usage_page == USAGE_PAGE_PS_AUTH {
+            log::info!("  feature {:#04x}: auth report, not read", r.id);
+            continue;
+        }
+        let len = (r.bits.div_ceil(8) as usize + 1).min(buf.len());
+        // HID 1.11 §7.2.1: wValue = report type << 8 | report ID.
+        let setup = SetupPacket::class_interface_in(
+            HID_REQ_GET_REPORT,
+            HID_REPORT_TYPE_FEATURE << 8 | u16::from(r.id),
+            u16::from(iface),
+            len as u16,
+        );
+        match ep0.control_in(&setup.to_bytes(), &mut buf[..len]).await {
+            Ok(n) => {
+                log::info!("  feature {:#04x} ({} bytes):", r.id, n);
+                log_hex_dump(&buf[..n]);
+            }
+            Err(e) => log::warn!("  feature {:#04x}: GET_REPORT failed: {:?}", r.id, e),
+        }
         Timer::after(LOG_DRAIN).await;
     }
 }
@@ -321,9 +372,9 @@ struct Globals {
     report_id: u8,
 }
 
-/// Log application collections and the byte size of every (report ID, type) pair.
-fn log_report_summary(desc: &[u8]) {
-    const MAX_REPORTS: usize = 24;
+/// Log application collections and the byte size of every (report ID, type) pair, and
+/// return those pairs.
+fn log_report_summary(desc: &[u8]) -> [Option<ReportSize>; MAX_REPORTS] {
     let mut reports: [Option<ReportSize>; MAX_REPORTS] = [None; MAX_REPORTS];
     let mut g = Globals::default();
     let mut stack = [Globals::default(); 4];
@@ -433,6 +484,7 @@ fn log_report_summary(desc: &[u8]) {
             r.usage_page
         );
     }
+    reports
 }
 
 /// Space-separated lowercase hex bytes.
