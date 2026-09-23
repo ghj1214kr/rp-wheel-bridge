@@ -170,7 +170,12 @@ pub struct SetReport {
 type CS = CriticalSectionRawMutex;
 const QUEUE_LEN: usize = 8;
 
-pub static HIDPP_IN: Channel<CS, Packet, QUEUE_LEN> = Channel::new();
+/// HID++ to the console drains slowly: DriveHub's EP 0x83 moves 20 bytes per 5 ms poll,
+/// so a long report takes several polls, and G HUB's start-up burst (~200 messages in a
+/// few seconds) overflowed 8 entries.
+const HIDPP_IN_QUEUE_LEN: usize = 32;
+
+pub static HIDPP_IN: Channel<CS, Packet, HIDPP_IN_QUEUE_LEN> = Channel::new();
 pub static HIDPP_OUT: Channel<CS, SetReport, QUEUE_LEN> = Channel::new();
 pub static FFB_IN: Channel<CS, Packet, QUEUE_LEN> = Channel::new();
 pub static FFB_OUT: Channel<CS, Packet, QUEUE_LEN> = Channel::new();
@@ -305,9 +310,9 @@ async fn log_if0_output(ep: &mut impl EndpointOut) -> ! {
 
 /// Queue → IN endpoint. HID++ reports can span several 20-byte packets; a report that
 /// fills its last packet is terminated with a zero-length packet.
-async fn forward_in(
+async fn forward_in<const N: usize>(
     ep: &mut impl EndpointIn,
-    queue: &'static Channel<CS, Packet, QUEUE_LEN>,
+    queue: &'static Channel<CS, Packet, N>,
     sent: &AtomicU32,
 ) -> ! {
     loop {
@@ -354,14 +359,12 @@ impl Handler for Control {
         }
         let [kind, id] = req.value.to_be_bytes();
         let data: &[u8] = match (req.request_type, req.request) {
-            (RequestType::Standard, Request::GET_DESCRIPTOR) => {
-                match (kind, req.index) {
-                    (DESC_TYPE_REPORT, IF_INPUT) => &IF0_REPORT_DESC,
-                    (DESC_TYPE_REPORT, IF_HIDPP) => &IF1_REPORT_DESC,
-                    (DESC_TYPE_REPORT, IF_FFB) => &IF2_REPORT_DESC,
-                    _ => return reject_in(&req),
-                }
-            }
+            (RequestType::Standard, Request::GET_DESCRIPTOR) => match (kind, req.index) {
+                (DESC_TYPE_REPORT, IF_INPUT) => &IF0_REPORT_DESC,
+                (DESC_TYPE_REPORT, IF_HIDPP) => &IF1_REPORT_DESC,
+                (DESC_TYPE_REPORT, IF_FFB) => &IF2_REPORT_DESC,
+                _ => return reject_in(&req),
+            },
             (RequestType::Class, HID_GET_REPORT) => match (kind, id, req.index) {
                 (REPORT_TYPE_FEATURE, 0x03, IF_INPUT) => &FEATURE_03,
                 (REPORT_TYPE_FEATURE, 0x31, IF_INPUT) => &FEATURE_31,

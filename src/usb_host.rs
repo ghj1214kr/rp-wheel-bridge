@@ -50,10 +50,6 @@ type HostController =
 pub type HostBus = embassy_usb_host::BusHandle<'static, PioUsbAllocator<'static, 'static, PIO0>>;
 pub type ControlPipe = PioPipe<'static, 'static, pipe::Control, pipe::InOut, PIO0>;
 
-/// Enumeration attempts per attach before giving up (each retry re-resets the port).
-/// DriveHub needs a few seconds after power-up and has taken 3.
-const ENUM_ATTEMPTS: u32 = 6;
-
 /// Room for the full configuration descriptor. Typical HID devices need < 100 bytes.
 const CONFIG_BUF_LEN: usize = 512;
 
@@ -121,13 +117,8 @@ pub async fn host_task(bus: &'static Bus<'static, PIO0>) {
             log::warn!("only full-speed devices are targeted for now; trying anyway");
         }
 
-        let Some((info, config_len)) =
-            enumerate_with_retry(&mut ctrl, &bus, speed, &mut config_buf).await
-        else {
-            wait_for_disconnect(&mut ctrl).await;
-            log::info!("USB device disconnected");
-            continue;
-        };
+        let (info, config_len) =
+            enumerate_with_retry(&mut ctrl, &bus, speed, &mut config_buf).await;
 
         let ifaces = hid::find_interfaces(&config_buf[..config_len]);
         hid::probe(&bus, &info, &ifaces).await;
@@ -164,33 +155,30 @@ pub fn open_ep0(bus: &HostBus, info: &EnumerationInfo) -> Result<ControlPipe, Ho
     bus.alloc_pipe::<pipe::Control, pipe::InOut>(info.device_address, &ep0, info.split())
 }
 
-/// Enumerate and log the device. Returns the enumeration info and the length of the
-/// configuration descriptor written to `config_buf`.
+/// Enumerate and log the device, retrying until it answers. Returns the enumeration info
+/// and the length of the configuration descriptor written to `config_buf`.
+///
+/// No attempt limit: a booting device (DriveHub, the wheel after a power cycle) can take
+/// several attempts, and with R13 fitted a detach is never seen, so giving up could only
+/// be undone by a reset.
 async fn enumerate_with_retry(
     ctrl: &mut HostController,
     bus: &HostBus,
     speed: Speed,
     config_buf: &mut [u8],
-) -> Option<(EnumerationInfo, usize)> {
-    for attempt in 1..=ENUM_ATTEMPTS {
+) -> (EnumerationInfo, usize) {
+    let mut attempt = 1u32;
+    loop {
         match enumerate_and_report(bus, speed, config_buf).await {
-            Ok(r) => return Some(r),
+            Ok(r) => return r,
             Err(e) => {
-                log::warn!(
-                    "USB enumeration failed (attempt {}/{}): {:?}",
-                    attempt,
-                    ENUM_ATTEMPTS,
-                    e
-                );
-                if attempt < ENUM_ATTEMPTS {
-                    // Put the device back into the default (address 0) state.
-                    ctrl.controller_mut().bus_reset().await;
-                }
+                log::warn!("USB enumeration failed (attempt {}): {:?}", attempt, e);
+                // Put the device back into the default (address 0) state.
+                ctrl.controller_mut().bus_reset().await;
+                attempt += 1;
             }
         }
     }
-    log::warn!("giving up on this device; replug it or reset the board");
-    None
 }
 
 async fn enumerate_and_report(
