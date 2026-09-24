@@ -39,7 +39,7 @@ use crate::device::{
     self, BACKEND_READY, CONTROL_OUT, ControlOut, FFB_IN, FFB_OUT, HID_SET_REPORT, HIDPP_IN,
     IF_HIDPP, INPUT_IN, PROFILE, Packet, Role, STATS,
 };
-use crate::hid::{Hex, HidInterface, MAX_HID_INTERFACES};
+use crate::hid::{GapMeter, Hex, HidInterface, MAX_HID_INTERFACES};
 use crate::usb_host::{ControlPipe, HostBus, open_ep0};
 use crate::{ghub_init, input_map};
 
@@ -52,9 +52,12 @@ const IF_FFB: u16 = 2;
 const HID_SET_IDLE: u8 = 0x0a;
 
 /// Force feedback runs at up to 1 kHz; log at most one packet per direction this often.
-const FFB_LOG_INTERVAL: Duration = Duration::from_millis(100);
+const FFB_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
+/// An FFB packet taking this long to reach the wheel is logged.
+const SLOW_FFB_OUT: Duration = Duration::from_millis(20);
+
 /// Pause after a failed IN transfer before polling again.
 const IN_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
@@ -145,7 +148,9 @@ pub async fn run(
         serve_ep0(&mut ep0),
         forward_in(bus, info, &if2_in, "FFB", {
             let mut sampler = Sampler::new();
+            let mut gap = GapMeter::new("FFB wheel -> bridge", Duration::from_millis(100));
             move |p| {
+                gap.tick();
                 count(&WHEEL_FFB);
                 sampler.log("FFB wheel -> upstream", p.bytes());
                 FFB_IN.try_send(p)
@@ -323,12 +328,20 @@ async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDes
         sampler.log("FFB upstream -> wheel", data);
         report.fill(0);
         report[..data.len()].copy_from_slice(data);
-        match pipe.request_out(&report, false).await {
+        let sent = Instant::now();
+        let result = pipe.request_out(&report, false).await;
+        let took = sent.elapsed();
+        if took >= SLOW_FFB_OUT {
+            log::info!("FFB bridge -> wheel: one packet took {} ms", took.as_millis());
+        }
+        match result {
             Ok(()) => count(&FFB_WRITTEN),
-            Err(e) => {
+            // The packet is dropped; the next one goes out as usual.
+            Err(e @ (PipeError::Disconnected | PipeError::Canceled)) => {
                 log::warn!("proxy: FFB OUT failed: {:?}; stopped", e);
                 return;
             }
+            Err(e) => log::warn!("proxy: FFB OUT failed: {:?}; packet dropped", e),
         }
     }
 }
@@ -447,9 +460,13 @@ impl Sampler {
         }
     }
 
+    /// Force feedback reports `01 00 00 00 <cmd> ...`: the force stream (cmd 01 to the
+    /// wheel, 02 back) is sampled, anything else (mode and setting commands, e.g.
+    /// `05 01` switching FFB on) is always logged.
     pub(crate) fn log(&mut self, what: &str, packet: &[u8]) {
         let now = Instant::now();
-        if self.last.is_some_and(|t| now - t < FFB_LOG_INTERVAL) {
+        let stream = packet.first() != Some(&0x01) || matches!(packet.get(4), Some(0x01 | 0x02));
+        if stream && self.last.is_some_and(|t| now - t < FFB_LOG_INTERVAL) {
             self.skipped += 1;
             return;
         }

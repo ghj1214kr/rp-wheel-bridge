@@ -490,6 +490,35 @@ fn log_report_summary(desc: &[u8]) -> [Option<ReportSize>; MAX_REPORTS] {
 /// Space-separated lowercase hex bytes.
 pub struct Hex<'a>(pub &'a [u8]);
 
+/// Logs when a packet stream that normally runs every few milliseconds pauses for at
+/// least `min` (diagnostics for the force feedback streams).
+pub struct GapMeter {
+    what: &'static str,
+    min: Duration,
+    last: Option<Instant>,
+}
+
+impl GapMeter {
+    pub const fn new(what: &'static str, min: Duration) -> Self {
+        Self {
+            what,
+            min,
+            last: None,
+        }
+    }
+
+    /// A packet of the stream just passed.
+    pub fn tick(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last
+            && now - last >= self.min
+        {
+            log::info!("{}: gap of {} ms", self.what, (now - last).as_millis());
+        }
+        self.last = Some(now);
+    }
+}
+
 impl fmt::Display for Hex<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, b) in self.0.iter().enumerate() {

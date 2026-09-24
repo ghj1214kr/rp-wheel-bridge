@@ -20,6 +20,7 @@
 //! signer's own bytes.
 
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -57,8 +58,19 @@ const SIGNER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Signing runs per console nonce. The HORI OCTA steps its F1 page on every GET it
 /// takes, also one whose reply is lost (500 ms timeout) or a SETUP resent after a
 /// garbled ACK (a page skipped), so a lost page can only be had again by signing the
-/// same nonce once more. Errors come in bursts of a second or two.
-const SIGN_ATTEMPTS: u32 = 10;
+/// same nonce once more. Errors come in bursts of a second or two. Kept low: after
+/// many signings in a row (10 attempts per round) the OCTA once stayed "signing" for
+/// good, round after round.
+const SIGN_ATTEMPTS: u32 = 4;
+/// Pauses when signing again. Attempts fired back to back (three in 0.3 s) ended with
+/// the OCTA refusing a nonce page, and twice the wheel on the same hub dropped out of
+/// force feedback half a second after such a burst.
+const RESIGN_PAUSE: Duration = Duration::from_millis(300);
+const RESET_SETTLE: Duration = Duration::from_millis(50);
+const NONCE_PAGE_GAP: Duration = Duration::from_millis(10);
+/// A "ready" F2 right after a nonce can be the previous signing's; it is believed
+/// only once "signing" has been seen, or after this long.
+const STALE_READY_GRACE: Duration = Duration::from_millis(500);
 
 /// F3 as DriveHub (both captures) answers it; given to the console until a signer's
 /// own F3 has been read.
@@ -204,6 +216,9 @@ pub async fn serve(ep0: &mut ControlPipe, iface: u16) -> ! {
     }
 }
 
+/// The signer refused a nonce page of the current nonce.
+static NONCE_REFUSED: AtomicBool = AtomicBool::new(false);
+
 /// The console's nonce pages, kept by the signer side to sign again.
 static NONCE: Mutex<CS, RefCell<[[u8; NONCE_LEN]; NONCE_PAGES]>> =
     Mutex::new(RefCell::new([[0; NONCE_LEN]; NONCE_PAGES]));
@@ -211,12 +226,7 @@ static NONCE: Mutex<CS, RefCell<[[u8; NONCE_LEN]; NONCE_PAGES]>> =
 /// Act on one console event, with the signer's auth reports on HID interface `iface`.
 pub async fn handle(cmd: Cmd, ep0: &mut ControlPipe, iface: u16) {
     match cmd {
-        Cmd::Reset => {
-            let mut buf = [0u8; RESET_LEN];
-            if let Some(n) = get_feature(ep0, iface, ID_RESET, &mut buf).await {
-                log::info!("auth: signer F3 (reset) = {}", Hex(&buf[..n]));
-            }
-        }
+        Cmd::Reset => reset_signer(ep0, iface).await,
         Cmd::Nonce(page) => {
             let data = page.bytes();
             if let Some(&n) = data.get(2)
@@ -225,11 +235,16 @@ pub async fn handle(cmd: Cmd, ep0: &mut ControlPipe, iface: u16) {
             {
                 NONCE.lock(|p| p.borrow_mut()[usize::from(n)].copy_from_slice(data));
             }
+            // A page the signer refused is resent with all the others once the last
+            // one is in (the console goes on at its pace regardless).
             if !set_nonce(ep0, iface, data).await {
-                return;
+                NONCE_REFUSED.store(true, Ordering::Relaxed);
             }
             if data.get(2) == Some(&LAST_NONCE_PAGE) {
-                sign(ep0, iface).await;
+                let resend = NONCE_REFUSED.swap(false, Ordering::Relaxed);
+                sign(ep0, iface, resend).await;
+            } else if data.get(2) == Some(&0) {
+                NONCE_REFUSED.store(false, Ordering::Relaxed);
             }
         }
     }
@@ -252,25 +267,43 @@ async fn set_nonce(ep0: &mut ControlPipe, iface: u16, data: &[u8]) -> bool {
 }
 
 /// Get the whole signature for the nonce just sent, signing it again (all nonce pages
-/// resent) whenever a page is lost.
-async fn sign(ep0: &mut ControlPipe, iface: u16) {
+/// resent) whenever a page is lost. `resend`: the signer refused a nonce page, so
+/// resend them all before the first attempt too.
+async fn sign(ep0: &mut ControlPipe, iface: u16, resend: bool) {
     for attempt in 1..=SIGN_ATTEMPTS {
-        if attempt > 1 {
-            log::info!("auth: signing the nonce again (attempt {})", attempt);
+        if attempt > 1 || resend {
+            log::info!("auth: sending the nonce again (attempt {})", attempt);
+            Timer::after(RESIGN_PAUSE).await;
+            // Start over as the console does: F3 first.
+            reset_signer(ep0, iface).await;
+            Timer::after(RESET_SETTLE).await;
             let pages = NONCE.lock(|p| *p.borrow());
             for page in &pages {
                 if !set_nonce(ep0, iface, page).await {
                     return;
                 }
+                Timer::after(NONCE_PAGE_GAP).await;
             }
         }
         match fetch_signature(ep0, iface).await {
             Fetch::Done => return,
             Fetch::PageLost => {}
-            Fetch::NotReady => return,
+            Fetch::NotReady => {
+                reset_signer(ep0, iface).await;
+                return;
+            }
         }
     }
     log::warn!("auth: no complete signature after {} attempts", SIGN_ATTEMPTS);
+    reset_signer(ep0, iface).await;
+}
+
+/// GET F3 on the signer, which resets its auth state.
+async fn reset_signer(ep0: &mut ControlPipe, iface: u16) {
+    let mut buf = [0u8; RESET_LEN];
+    if let Some(n) = get_feature(ep0, iface, ID_RESET, &mut buf).await {
+        log::info!("auth: signer F3 (reset) = {}", Hex(&buf[..n]));
+    }
 }
 
 enum Fetch {
@@ -286,6 +319,7 @@ async fn fetch_signature(ep0: &mut ControlPipe, iface: u16) -> Fetch {
     let start = Instant::now();
     let mut state = [0u8; STATE_LEN];
     let mut last = [0xffu8; 3];
+    let mut seen_signing = false;
     loop {
         if start.elapsed() >= SIGNER_TIMEOUT {
             log::warn!(
@@ -306,7 +340,9 @@ async fn fetch_signature(ep0: &mut ControlPipe, iface: u16) -> Fetch {
                 );
                 last.copy_from_slice(&state[..3]);
             }
-            if state[2] == STATE_READY {
+            seen_signing |= state[2] == STATE_SIGNING;
+            if state[2] == STATE_READY && (seen_signing || start.elapsed() >= STALE_READY_GRACE)
+            {
                 break;
             }
         }

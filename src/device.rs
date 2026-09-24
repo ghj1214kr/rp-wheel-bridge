@@ -41,7 +41,7 @@ use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestT
 use embassy_usb::driver::{Direction, EndpointAddress, EndpointIn, EndpointOut};
 use embassy_usb::{Builder, Config, Handler, UsbVersion};
 
-use crate::hid::Hex;
+use crate::hid::{GapMeter, Hex};
 use crate::{auth, input_map};
 
 /// The personality the native port presents.
@@ -523,9 +523,11 @@ async fn forward_in<const N: usize>(
 /// IF2 OUT (force feedback) → wheel.
 async fn forward_ffb_out(ep: &mut impl EndpointOut) -> ! {
     let mut buf = [0u8; MAX_PACKET];
+    let mut gap = GapMeter::new("FFB console -> bridge", embassy_time::Duration::from_millis(100));
     loop {
         ep.wait_enabled().await;
         while let Ok(n) = ep.read(&mut buf).await {
+            gap.tick();
             count(&STATS.ffb_received);
             if FFB_OUT.try_send(Packet::new(&buf[..n])).is_err() {
                 count(&STATS.dropped);
