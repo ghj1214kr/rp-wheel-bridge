@@ -20,7 +20,8 @@
 //! - IF0 output (0x05, 0x30): relay, to DriveHub ([`IF0_OUT`]); wheel role, logged.
 //! - IF1 HID++: backend reports → [`HIDPP_IN`] → IN endpoint; SET_REPORT → [`CONTROL_OUT`].
 //! - IF2 force feedback: backend reports → [`FFB_IN`] → IN endpoint; OUT → [`FFB_OUT`].
-//! - c269: IF0 feature 0x03/0x31 are answered with DriveHub's values.
+//! - c269: IF0 feature 0x03/0x31 are answered with DriveHub's values; auth (F0-F3)
+//!   through [`crate::auth`], signed by DriveHub (relay) or the licensed pad (wheel role).
 //!
 //! Control requests are answered synchronously (embassy-usb `Handler`), so nothing
 //! here waits for the backend.
@@ -563,10 +564,10 @@ impl Handler for Control {
             }
             (RequestType::Class, HID_GET_REPORT) => {
                 let feature = PROFILE.features.iter().find(|f| f[0] == id);
-                let relay_auth = PROFILE.role == Role::Relay
+                let auth_request = PROFILE.role != Role::Mirror
                     && kind == REPORT_TYPE_FEATURE
                     && req.index == IF_INPUT;
-                if relay_auth && let Some(n) = auth::get_report(id, buf) {
+                if auth_request && let Some(n) = auth::get_report(id, buf) {
                     return Some(InResponse::Accepted(&buf[..n]));
                 }
                 match (kind, id, req.index, feature) {
@@ -611,7 +612,7 @@ impl Handler for Control {
             count(&STATS.hidpp_set_report);
         }
         let [kind, id] = req.value.to_be_bytes();
-        if PROFILE.role == Role::Relay
+        if PROFILE.role != Role::Mirror
             && req.request == HID_SET_REPORT
             && req.index == IF_INPUT
             && kind == REPORT_TYPE_FEATURE

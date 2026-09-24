@@ -5,6 +5,7 @@ mod auth;
 mod device;
 mod ghub_init;
 mod hid;
+mod hub;
 mod input_map;
 mod proxy;
 mod relay;

@@ -9,6 +9,10 @@
 //! - F2 (GET, 15 + ID): `F2 <nonce id> <0x10 signing | 0x00 ready> 00 ...`.
 //! - F1 (GET, 63 + ID) ×19: `F1 <nonce id> <page 0..18> 00 <56 bytes> ...`.
 //!
+//! Signers: DriveHub in the relay role ([`crate::relay`] drives [`handle`]), or in the
+//! wheel role any other device behind the bridge that answers F3 ([`try_signer`], then
+//! [`serve`]) — the licensed auth pad.
+//!
 //! The console's GET_REPORTs must be answered on the spot (embassy-usb control handlers
 //! are synchronous), so the relay leans on the console polling F2: nonce pages go to
 //! the signer as they arrive, and until all signature pages are fetched from it the
@@ -49,16 +53,19 @@ const STATE_READY: u8 = 0x00;
 const SIGNER_POLL: Duration = Duration::from_millis(20);
 const SIGNER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// F3 as DriveHub (both captures) answers it; given to the console until a signer's
+/// own F3 has been read.
+const DEFAULT_RESET: [u8; RESET_LEN] = [0xf3, 0x00, 0x38, 0x38, 0x00, 0x00, 0x00, 0x00];
+
 const HID_GET_REPORT: u8 = 0x01;
 const HID_SET_REPORT: u8 = 0x09;
 const REPORT_TYPE_FEATURE: u16 = 0x03;
-const IF_AUTH: u16 = 0;
 
 type CS = CriticalSectionRawMutex;
 
 struct State {
     /// The signer's F3 answer.
-    reset: Option<[u8; RESET_LEN]>,
+    reset: [u8; RESET_LEN],
     nonce_id: u8,
     /// Signature pages fetched and the signer's final F2 cached.
     ready: bool,
@@ -69,7 +76,7 @@ struct State {
 }
 
 static STATE: Mutex<CS, RefCell<State>> = Mutex::new(RefCell::new(State {
-    reset: None,
+    reset: DEFAULT_RESET,
     nonce_id: 0,
     ready: false,
     ready_state: [0; STATE_LEN],
@@ -99,7 +106,7 @@ pub fn get_report(id: u8, buf: &mut [u8]) -> Option<usize> {
                 s.ready = false;
                 s.next_page = 0;
                 send(Cmd::Reset);
-                let reset = s.reset?;
+                let reset = s.reset;
                 buf[..RESET_LEN].copy_from_slice(&reset);
                 log::info!("auth: console GET F3 -> {}", Hex(&reset));
                 Some(RESET_LEN)
@@ -164,25 +171,38 @@ fn send(cmd: Cmd) {
 
 // ---- signer side (core 1, the host's control pipe to the signing device) ----
 
-/// Read the signer's F3 before the console connects, so the first console F3 can be
-/// answered.
-pub async fn prefetch(ep0: &mut ControlPipe) {
+/// Read the signer's F3 (on HID interface `iface`) and answer the console's F3 with it
+/// from now on. Returns whether the device answered, i.e. can sign.
+pub async fn try_signer(ep0: &mut ControlPipe, iface: u16) -> bool {
     let mut buf = [0u8; RESET_LEN];
-    match get_feature(ep0, ID_RESET, &mut buf).await {
+    match get_feature(ep0, iface, ID_RESET, &mut buf).await {
         Some(n) => {
             log::info!("auth: signer F3 = {}", Hex(&buf[..n]));
-            STATE.lock(|s| s.borrow_mut().reset = Some(buf));
+            STATE.lock(|s| s.borrow_mut().reset = buf);
+            true
         }
-        None => log::warn!("auth: signer F3 unreadable; console F3 will be rejected"),
+        None => false,
     }
 }
 
-/// Act on one console event.
-pub async fn handle(cmd: Cmd, ep0: &mut ControlPipe) {
+/// Wheel role: act on the console's auth events with this signer until a transfer
+/// fails badly enough to stop. Events queued while there was no signer are dropped
+/// (the console starts over).
+pub async fn serve(ep0: &mut ControlPipe, iface: u16) -> ! {
+    CMD.clear();
+    log::info!("auth: signer ready (IF{})", iface);
+    loop {
+        let cmd = CMD.receive().await;
+        handle(cmd, ep0, iface).await;
+    }
+}
+
+/// Act on one console event, with the signer's auth reports on HID interface `iface`.
+pub async fn handle(cmd: Cmd, ep0: &mut ControlPipe, iface: u16) {
     match cmd {
         Cmd::Reset => {
             let mut buf = [0u8; RESET_LEN];
-            if let Some(n) = get_feature(ep0, ID_RESET, &mut buf).await {
+            if let Some(n) = get_feature(ep0, iface, ID_RESET, &mut buf).await {
                 log::info!("auth: signer F3 (reset) = {}", Hex(&buf[..n]));
             }
         }
@@ -191,7 +211,7 @@ pub async fn handle(cmd: Cmd, ep0: &mut ControlPipe) {
             let setup = SetupPacket::class_interface_out(
                 HID_SET_REPORT,
                 REPORT_TYPE_FEATURE << 8 | u16::from(ID_NONCE),
-                IF_AUTH,
+                iface,
                 data.len() as u16,
             );
             if let Err(e) = ep0.control_out(&setup.to_bytes(), data).await {
@@ -200,14 +220,14 @@ pub async fn handle(cmd: Cmd, ep0: &mut ControlPipe) {
             }
             log::debug!("auth: signer SET F0 [{}]: {}", data.len(), Hex(data));
             if data.get(2) == Some(&LAST_NONCE_PAGE) {
-                fetch_signature(ep0).await;
+                fetch_signature(ep0, iface).await;
             }
         }
     }
 }
 
 /// Poll the signer's F2 until it is ready, then fetch every F1 page and publish them.
-async fn fetch_signature(ep0: &mut ControlPipe) {
+async fn fetch_signature(ep0: &mut ControlPipe, iface: u16) {
     let start = Instant::now();
     let mut state = [0u8; STATE_LEN];
     let mut last = [0xffu8; 3];
@@ -219,7 +239,10 @@ async fn fetch_signature(ep0: &mut ControlPipe) {
             );
             return;
         }
-        if get_feature(ep0, ID_STATE, &mut state).await.is_some() {
+        if get_feature(ep0, iface, ID_STATE, &mut state)
+            .await
+            .is_some()
+        {
             if state[..3] != last {
                 log::info!(
                     "auth: signer F2 = {} ({} ms)",
@@ -237,7 +260,7 @@ async fn fetch_signature(ep0: &mut ControlPipe) {
 
     let mut pages = [[0u8; SIGNATURE_LEN]; SIGNATURE_PAGES];
     for (i, page) in pages.iter_mut().enumerate() {
-        if get_feature(ep0, ID_SIGNATURE, page).await.is_none() {
+        if get_feature(ep0, iface, ID_SIGNATURE, page).await.is_none() {
             log::warn!("auth: signer F1 page {} unreadable", i);
             return;
         }
@@ -257,12 +280,13 @@ async fn fetch_signature(ep0: &mut ControlPipe) {
     );
 }
 
-/// GET_REPORT(Feature, `id`) on IF0 into `buf`; `None` on failure (logged).
-async fn get_feature(ep0: &mut ControlPipe, id: u8, buf: &mut [u8]) -> Option<usize> {
+/// GET_REPORT(Feature, `id`) on HID interface `iface` into `buf`; `None` on failure
+/// (logged).
+async fn get_feature(ep0: &mut ControlPipe, iface: u16, id: u8, buf: &mut [u8]) -> Option<usize> {
     let setup = SetupPacket::class_interface_in(
         HID_GET_REPORT,
         REPORT_TYPE_FEATURE << 8 | u16::from(id),
-        IF_AUTH,
+        iface,
         buf.len() as u16,
     );
     match ep0.control_in(&setup.to_bytes(), buf).await {

@@ -69,7 +69,9 @@ pub async fn run(
         }
     };
 
-    auth::prefetch(&mut ep0).await;
+    if !auth::try_signer(&mut ep0, 0).await {
+        log::warn!("relay: DriveHub F3 unreadable; answering the console with the default");
+    }
     log::info!("relay: forwarding DriveHub (c269) to the PS5");
     BACKEND_READY.signal(());
 
@@ -150,7 +152,7 @@ async fn serve_ep0(ep0: &mut ControlPipe) {
                     count(&HIDPP_WRITTEN);
                 }
             }
-            Either::Second(cmd) => auth::handle(cmd, ep0).await,
+            Either::Second(cmd) => auth::handle(cmd, ep0, 0).await,
         }
     }
 }

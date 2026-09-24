@@ -11,7 +11,8 @@
 //! boot even with nothing plugged in and detach is never seen. Plug the device in first,
 //! then reset the RP2350.
 //!
-//! Scope: one full-speed device directly on the port. No hub, no hot-plug requirement.
+//! Scope: one full-speed device directly on the port, or a hub with full-speed devices
+//! behind it ([`crate::hub`]; the wheel and the licensed auth pad together).
 //!
 //! SOFs: the G Pro powers off about a second after SET_CONFIGURATION unless the SOF
 //! period is steady (USB 2.0 §7.1.12: 1.000 ms ± 0.5 µs); SOFs sent by an interrupt
@@ -44,11 +45,13 @@ use rp_pio_usb_host::{Bus, PioPipe, PioUsbAllocator, PioUsbController, Pulldown}
 use static_cell::StaticCell;
 
 use crate::device::{PROFILE, Role};
-use crate::{hid, proxy, relay};
+use crate::hid::{HidInterface, MAX_HID_INTERFACES};
+use crate::{auth, hid, hub, proxy, relay};
 
 type HostController =
     embassy_usb_host::BusController<'static, PioUsbController<'static, 'static, PIO0>>;
-pub type HostBus = embassy_usb_host::BusHandle<'static, PioUsbAllocator<'static, 'static, PIO0>>;
+pub type Allocator = PioUsbAllocator<'static, 'static, PIO0>;
+pub type HostBus = embassy_usb_host::BusHandle<'static, Allocator>;
 pub type ControlPipe = PioPipe<'static, 'static, pipe::Control, pipe::InOut, PIO0>;
 
 /// Room for the full configuration descriptor. Typical HID devices need < 100 bytes.
@@ -100,9 +103,9 @@ pub async fn idle_task(bus: &'static Bus<'static, PIO0>) {
     bus.idle_task().await;
 }
 
-/// Waits for a device, enumerates it, logs its descriptors and probes its HID
-/// interfaces. The G Pro (c272) is then forwarded to the PS device; any other device's
-/// input reports are logged. Runs until the device detaches.
+/// Waits for a device on the root port, enumerates it and serves it
+/// ([`serve_device`]), or the devices behind it if it is a hub. Runs until the device
+/// detaches.
 #[embassy_executor::task]
 pub async fn host_task(bus: &'static Bus<'static, PIO0>) {
     static BUS_STATE: BusState = BusState::new();
@@ -122,27 +125,13 @@ pub async fn host_task(bus: &'static Bus<'static, PIO0>) {
             enumerate_with_retry(&mut ctrl, &bus, speed, &mut config_buf).await;
 
         let ifaces = hid::find_interfaces(&config_buf[..config_len]);
-        let d = &info.device_desc;
-        let is_wheel = (d.vendor_id, d.product_id) == (proxy::WHEEL_VID, proxy::WHEEL_PID);
-        // Not for the wheel: its descriptors are known, and it wants host software to
-        // talk to it right after SET_CONFIGURATION (see `proxy`); the probe's ~0.5 s of
-        // descriptor reads and log pauses made it switch off about half the time.
-        if !is_wheel {
-            hid::probe(&bus, &info, &ifaces).await;
-        }
-        let is_relay_backend = PROFILE.role == Role::Relay
-            && (d.vendor_id, d.product_id) == (relay::BACKEND_VID, relay::BACKEND_PID);
         let serve = async {
-            if is_wheel {
-                proxy::run(&bus, &info, &ifaces).await;
-                log::warn!("proxy stopped");
-            } else if is_relay_backend {
-                relay::run(&bus, &info, &ifaces).await;
-                log::warn!("relay stopped");
-            } else {
-                log::info!("monitoring HID input reports (changes only)...");
-                hid::monitor(&bus, &info, &ifaces).await;
-                log::warn!("all HID monitors stopped");
+            match classify(&info) {
+                Kind::Hub => {
+                    hub::run(&bus, &info).await;
+                    log::warn!("hub stopped");
+                }
+                kind => serve_device(&bus, &info, &ifaces, kind).await,
             }
         };
         // With R13 fitted a detach is never seen, so this runs until reset.
@@ -151,6 +140,72 @@ pub async fn host_task(bus: &'static Bus<'static, PIO0>) {
         }
         log::info!("USB device disconnected");
         bus.free_address(info.device_address);
+    }
+}
+
+/// What an enumerated device is to the bridge.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The G Pro Xbox/PC (c272).
+    Wheel,
+    /// DriveHub (c269), in the relay role.
+    RelayBackend,
+    Hub,
+    /// Anything else: in the wheel role, a candidate signer for the console's auth.
+    Other,
+}
+
+pub fn classify(info: &EnumerationInfo) -> Kind {
+    let d = &info.device_desc;
+    match (d.vendor_id, d.product_id) {
+        (proxy::WHEEL_VID, proxy::WHEEL_PID) => Kind::Wheel,
+        (relay::BACKEND_VID, relay::BACKEND_PID) if PROFILE.role == Role::Relay => {
+            Kind::RelayBackend
+        }
+        _ if d.device_class == CLASS_HUB => Kind::Hub,
+        _ => Kind::Other,
+    }
+}
+
+/// Serve one enumerated device (not a hub) until a transfer fails:
+/// - the wheel: forwarded to the native-port device ([`proxy`]);
+/// - DriveHub in the relay role: relayed ([`relay`]);
+/// - anything else: its HID interfaces are probed; in the wheel role, if it answers
+///   the auth reset report it signs the console's auth ([`auth`]); otherwise its input
+///   reports are logged.
+pub async fn serve_device(
+    bus: &HostBus,
+    info: &EnumerationInfo,
+    ifaces: &[Option<HidInterface>; MAX_HID_INTERFACES],
+    kind: Kind,
+) {
+    match kind {
+        // No probe for the wheel: its descriptors are known, and it wants host software
+        // to talk to it right after SET_CONFIGURATION (see `proxy`); the probe's ~0.5 s
+        // of descriptor reads and log pauses made it switch off about half the time.
+        Kind::Wheel => {
+            proxy::run(bus, info, ifaces).await;
+            log::warn!("proxy stopped");
+        }
+        Kind::RelayBackend => {
+            hid::probe(bus, info, ifaces).await;
+            relay::run(bus, info, ifaces).await;
+            log::warn!("relay stopped");
+        }
+        Kind::Hub => log::warn!("hub not expected here"),
+        Kind::Other => {
+            hid::probe(bus, info, ifaces).await;
+            if PROFILE.role == Role::Wheel
+                && let Some(iface) = ifaces.iter().flatten().next()
+                && let Ok(mut ep0) = open_ep0(bus, info)
+                && auth::try_signer(&mut ep0, u16::from(iface.number)).await
+            {
+                auth::serve(&mut ep0, u16::from(iface.number)).await;
+            }
+            log::info!("monitoring HID input reports (changes only)...");
+            hid::monitor(bus, info, ifaces).await;
+            log::warn!("all HID monitors stopped");
+        }
     }
 }
 
@@ -199,18 +254,16 @@ async fn enumerate_and_report(
     // enumerate(): GET_DESCRIPTOR(device, 8) -> SET_ADDRESS -> GET_DESCRIPTOR(device)
     // -> GET_DESCRIPTOR(config) -> SET_CONFIGURATION.
     let (info, config_len) = bus.enumerate(BusRoute::Direct(speed), config_buf).await?;
-
-    log_device_descriptor(&info);
-    log_config_descriptor(&config_buf[..config_len]);
-
-    // String descriptors are informational only; failures are logged, not fatal.
-    log_strings(bus, &info).await;
-
-    if info.device_desc.device_class == CLASS_HUB {
-        log::warn!("device is a USB hub; hubs are not supported yet");
-    }
-
+    log_device(bus, &info, &config_buf[..config_len]).await;
     Ok((info, config_len))
+}
+
+/// Log an enumerated device: device and configuration descriptors, strings.
+pub async fn log_device(bus: &HostBus, info: &EnumerationInfo, config: &[u8]) {
+    log_device_descriptor(info);
+    log_config_descriptor(config);
+    // String descriptors are informational only; failures are logged, not fatal.
+    log_strings(bus, info).await;
 }
 
 async fn wait_for_disconnect(ctrl: &mut HostController) {
@@ -403,7 +456,7 @@ impl fmt::Display for Utf16Le<'_> {
     }
 }
 
-fn speed_name(speed: Speed) -> &'static str {
+pub fn speed_name(speed: Speed) -> &'static str {
     match speed {
         Speed::Low => "low-speed",
         Speed::Full => "full-speed",

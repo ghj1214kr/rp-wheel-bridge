@@ -1275,7 +1275,7 @@ dependencies = [
 [[package]]
 name = "rp-pio-usb-host"
 version = "0.1.0"
-source = "git+https://github.com/ghj1214kr/rp-pio-usb-host?rev=592348c6e04b1613b17bc144551e3ae8810e88c4#592348c6e04b1613b17bc144551e3ae8810e88c4"
+source = "git+https://github.com/ghj1214kr/rp-pio-usb-host?rev=ebafabb814f7c0c5cfdd7abba44171e2d65304b6#ebafabb814f7c0c5cfdd7abba44171e2d65304b6"
 dependencies = [
  "critical-section",
  "embassy-rp",
