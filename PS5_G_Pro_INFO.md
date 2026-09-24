@@ -354,6 +354,63 @@ GT7 driving (`captures/mirror_drive.txt`, race start ~49 s, driving 55-65 s):
 - IF0 input reached ~700 reports/s while driving. The mirror's 8-entry IF0 queue
   dropped ~2 % because DriveHub polls slower than that.
 
+### 0.6 PS5 ⇄ DriveHub, captured through the bridge's relay (2026-09-24)
+
+Setup: PS5 ← [bridge: device = c269 (DriveHub's descriptors, placeholder serial) |
+host] ← DriveHub (c272 wheel + licensed auth pad). Auth goes through the bridge's
+cache (`src/auth.rs`); everything else is passed through packet by packet. The PS5
+accepted the device on the first try, and GT7 was driven.
+
+The PS5's side, in order:
+
+1. SET_CONFIGURATION, GET_REPORT feature 0x03 (48 B), SET_IDLE(0) on IF0/IF1/IF2.
+   DriveHub STALLs SET_IDLE.
+2. GET_REPORT feature 0x31 (253 B), 2.3 s later. The placeholder serial in it (and in
+   the string descriptor) was accepted.
+3. IF0 output report 0x30 (32 bytes on EP 0x01), classic Logitech commands:
+   `f3`, `f4`, `f8 04 01`, `f8 12 00`, `f5`, `f8 04 01`, `f8 81 38 04` (range 1080),
+   `f8 12 00`, `13`.
+4. Force feedback on IF2 starts at the same time. See below.
+5. Auth, about 3 s after connecting:
+
+   ```text
+   GET F3                       -> f3 00 38 38 00 00 00 00
+   SET F0 x5 (1 s apart)        f0 <nonce id 01> <page 0..4> 00 <56 B> ...; last page
+                                ends with 4 bytes (CRC?)
+   (signer: F2 f2 01 10 ... "signing" -> f2 01 00 ... "ready" after 268 ms)
+   GET F2 (2 s after last F0)   -> f2 01 00 ...
+   GET F1 x19 (1 s apart)       f1 01 <page 0..18> 00 <56 B> 00 00 00 00
+   ```
+
+   The whole exchange takes ~27 s, paced by the PS5 at one page per second. The
+   bridge's cache was ready 383 ms after the last nonce page. The auth layout in
+   `src/auth.rs` (0x10 signing / 0x00 ready, 5 + 19 pages) is confirmed.
+6. In GT7, via 0x30 again: `f8 04 01`, `f8 81 84 03` (range 900), then **rev LEDs**
+   `f8 12 <mask>` with mask 0f/07/03/01 as the revs change.
+
+**No HID++ at all** passed between the PS5 and DriveHub. On a c269, range and LEDs use
+the classic G29-style 0x30 commands. DriveHub turns them into HID++ for the c272
+(0x8138 set range, 0x807a function 6 for LEDs, §0.5).
+
+Force feedback, PS5 → DriveHub (IF2 EP 0x02):
+
+- The same native command format as DriveHub → c272
+  (`01 00 00 00 02 <seq> <F16> <F16>`, ~250 Hz), starting with `01 00 00 00 05 01`.
+- The packets are **cut short**: 12 bytes (7 and 9 for the first ones), not 64.
+  DriveHub pads them with zeros to 64 for the wheel.
+- DriveHub → PS5 (EP 0x82): 64-byte status reports, like the c272's IF2 IN.
+
+Consequences for the bridge's own PS5 mode (c272 behind it):
+
+- Pad FFB OUT to 64 bytes. Done.
+- Translate 0x30 `f8 81 lo hi` into HID++ 0x8138 set range.
+- Translate `f8 12 mask` into rev LEDs (0x807a fn 6). The mask → HID++ value mapping
+  (`00 01 00 0a 00 NN`, NN 04/06/08/0a seen) still needs a correlated capture.
+- `f3/f4/f5/13/f8 04 01` are G29 autocenter/force-slot commands. The native FFB stream
+  makes them irrelevant, probably.
+- For auth, put the licensed pad behind the bridge as the signer (a hub or a second
+  host port).
+
 Both MITM setups need the native USB port for the device side. The CDC logger must
 then move to a UART (or become part of a composite device).
 

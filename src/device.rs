@@ -1,23 +1,29 @@
-//! Native USB device, in one of two personalities ([`PROFILE`]):
+//! Native USB device, in one of three roles ([`PROFILE`]):
 //!
-//! - [`PS5`]: the PlayStation-mode G Pro (046d:c269), reproduced from what DriveHub
-//!   presents (PS5_G_Pro_INFO.md §0.2-0.4): same descriptors, endpoint numbers and
-//!   packet sizes, same feature reports. IF0 input is translated by the proxy.
-//! - [`MIRROR_C272`]: the wheel itself (046d:c272), for putting the bridge between
-//!   DriveHub and the wheel and recording what DriveHub sends. Everything is forwarded
-//!   unchanged, class control requests included. Upstream requests sent before the
-//!   wheel is enumerated wait in [`CONTROL_OUT`] (see [`MIRROR_WAIT_FOR_WHEEL`]).
+//! - [`PS5`] ([`Role::Wheel`]): the PlayStation-mode G Pro (046d:c269), reproduced from
+//!   what DriveHub presents (PS5_G_Pro_INFO.md §0.2-0.4): same descriptors, endpoint
+//!   numbers and packet sizes, same feature reports; the c272 wheel behind it, its IF0
+//!   input translated by [`crate::proxy`].
+//! - [`RELAY_C269`] ([`Role::Relay`]): the same identity, with DriveHub (itself a c269)
+//!   behind it instead of the wheel ([`crate::relay`]), to record what the PS5 and
+//!   DriveHub exchange. Everything is passed through packet by packet, auth (F0-F3) via
+//!   [`crate::auth`]. Connects only once DriveHub is enumerated.
+//! - [`MIRROR_C272`] ([`Role::Mirror`]): the wheel itself (046d:c272), for putting the
+//!   bridge between DriveHub and the wheel and recording what DriveHub sends. Everything
+//!   is forwarded unchanged, class control requests included. Upstream requests sent
+//!   before the wheel is enumerated wait in [`CONTROL_OUT`] (see
+//!   [`MIRROR_WAIT_FOR_WHEEL`]).
 //!
-//! Data paths (the host side, [`crate::proxy`], fills and drains the queues):
-//! - IF0 input: PS5, the latest translated wheel report ([`set_input`]), sent at every
-//!   poll like a DS4 does; mirror, each wheel report ([`INPUT_IN`]).
-//! - IF1 HID++: wheel reports → [`HIDPP_IN`] → IN endpoint; SET_REPORT → [`CONTROL_OUT`].
-//! - IF2 force feedback: wheel reports → [`FFB_IN`] → IN endpoint; OUT → [`FFB_OUT`].
-//! - PS5 only: IF0 feature 0x03/0x31 are answered with DriveHub's values. Auth reports
-//!   (F0-F3), output 0x05/0x30 and anything else are logged; auth is not implemented yet.
+//! Data paths (the host side fills and drains the queues):
+//! - IF0 input: wheel role, the latest translated wheel report ([`set_input`]), sent at
+//!   every poll like a DS4 does; otherwise each backend report ([`INPUT_IN`]).
+//! - IF0 output (0x05, 0x30): relay, to DriveHub ([`IF0_OUT`]); wheel role, logged.
+//! - IF1 HID++: backend reports → [`HIDPP_IN`] → IN endpoint; SET_REPORT → [`CONTROL_OUT`].
+//! - IF2 force feedback: backend reports → [`FFB_IN`] → IN endpoint; OUT → [`FFB_OUT`].
+//! - c269: IF0 feature 0x03/0x31 are answered with DriveHub's values.
 //!
 //! Control requests are answered synchronously (embassy-usb `Handler`), so nothing
-//! here waits for the wheel.
+//! here waits for the backend.
 
 use core::cell::Cell;
 use core::future::pending;
@@ -35,7 +41,7 @@ use embassy_usb::driver::{Direction, EndpointAddress, EndpointIn, EndpointOut};
 use embassy_usb::{Builder, Config, Handler, UsbVersion};
 
 use crate::hid::Hex;
-use crate::input_map;
+use crate::{auth, input_map};
 
 /// The personality the native port presents.
 pub static PROFILE: &Profile = &PS5;
@@ -70,12 +76,22 @@ pub const IF_HIDPP: u16 = 1;
 #[derive(Clone, Copy)]
 pub struct Ep(u8, u16, u8);
 
-/// Everything that differs between the two personalities.
+/// What is behind the device, and how it is forwarded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The c272 wheel; IF0 translated, HID++ and force feedback passed through.
+    Wheel,
+    /// A device with the same identity (DriveHub); everything passed through.
+    Relay,
+    /// The c272 wheel, presented as itself; everything passed through.
+    Mirror,
+}
+
+/// Everything that differs between the personalities.
 pub struct Profile {
     /// Log prefix.
     pub name: &'static str,
-    /// Mirror the wheel: forward everything unchanged, connect once the wheel is up.
-    pub mirror: bool,
+    pub role: Role,
     vid: u16,
     pid: u16,
     release: u16,
@@ -97,10 +113,9 @@ pub struct Profile {
 }
 
 /// The PlayStation-mode G Pro as DriveHub presents it.
-#[allow(dead_code)] // one profile is selected at a time
-pub static PS5: Profile = Profile {
+const C269: Profile = Profile {
     name: "PS device",
-    mirror: false,
+    role: Role::Wheel,
     vid: 0x046d,
     pid: 0xc269,
     release: 0x3300,
@@ -124,11 +139,23 @@ pub static PS5: Profile = Profile {
     features: &[&FEATURE_03, &FEATURE_31],
 };
 
+/// c269 with the wheel behind it.
+#[allow(dead_code)] // one profile is selected at a time
+pub static PS5: Profile = C269;
+
+/// c269 with DriveHub behind it.
+#[allow(dead_code)] // one profile is selected at a time
+pub static RELAY_C269: Profile = Profile {
+    name: "relay device",
+    role: Role::Relay,
+    ..C269
+};
+
 /// The G Pro Xbox/PC itself, as dumped from the wheel.
 #[allow(dead_code)] // one profile is selected at a time
 pub static MIRROR_C272: Profile = Profile {
     name: "mirror device",
-    mirror: true,
+    role: Role::Mirror,
     vid: 0x046d,
     pid: 0xc272,
     release: 0x3309,
@@ -281,9 +308,13 @@ pub static HIDPP_IN: Channel<CS, Packet, HIDPP_IN_QUEUE_LEN> = Channel::new();
 pub static CONTROL_OUT: Channel<CS, ControlOut, QUEUE_LEN> = Channel::new();
 pub static FFB_IN: Channel<CS, Packet, QUEUE_LEN> = Channel::new();
 pub static FFB_OUT: Channel<CS, Packet, QUEUE_LEN> = Channel::new();
+/// Relay: IF0 output reports from the console, for DriveHub.
+pub static IF0_OUT: Channel<CS, Packet, QUEUE_LEN> = Channel::new();
 
-/// Mirror only: the proxy signals this once the wheel is enumerated.
-pub static WHEEL_READY: Signal<CS, ()> = Signal::new();
+/// The host side signals this once the device behind the bridge is enumerated (and,
+/// for the relay, its feature reports are cached). Waited for by the relay, and by the
+/// mirror if [`MIRROR_WAIT_FOR_WHEEL`].
+pub static BACKEND_READY: Signal<CS, ()> = Signal::new();
 
 static INPUT: Mutex<CS, Cell<[u8; input_map::C269_LEN]>> =
     Mutex::new(Cell::new(input_map::neutral()));
@@ -324,10 +355,15 @@ pub fn count(counter: &AtomicU32) {
 #[embassy_executor::task]
 pub async fn task(driver: Driver<'static, USB>) -> ! {
     let p = PROFILE;
-    if p.mirror && MIRROR_WAIT_FOR_WHEEL {
+    let wait = match p.role {
+        Role::Wheel => false,
+        Role::Relay => true,
+        Role::Mirror => MIRROR_WAIT_FOR_WHEEL,
+    };
+    if wait {
         // The D+ pull-up is enabled by `Builder::build`: stay off the bus until then.
-        log::info!("{}: waiting for the wheel", p.name);
-        WHEEL_READY.wait().await;
+        log::info!("{}: waiting for the device behind the bridge", p.name);
+        BACKEND_READY.wait().await;
     }
 
     let mut config = Config::new(p.vid, p.pid);
@@ -391,7 +427,7 @@ pub async fn task(driver: Driver<'static, USB>) -> ! {
     join5(
         usb.run(),
         send_input(&mut if0_in),
-        log_if0_output(if0_out.as_mut()),
+        if0_output(if0_out.as_mut()),
         forward_in(&mut if1_in, &HIDPP_IN, &STATS.hidpp_sent),
         join(
             forward_in(&mut if2_in, &FFB_IN, &STATS.ffb_sent),
@@ -406,9 +442,10 @@ fn ep(number: u8, dir: Direction) -> EndpointAddress {
     EndpointAddress::from_parts(usize::from(number), dir)
 }
 
-/// IF0 IN. PS5: the latest input report at every poll. Mirror: each wheel report.
+/// IF0 IN. Wheel role: the latest input report at every poll. Otherwise each backend
+/// report.
 async fn send_input(ep: &mut impl EndpointIn) -> ! {
-    if PROFILE.mirror {
+    if PROFILE.role != Role::Wheel {
         forward_in(ep, &INPUT_IN, &STATS.input_sent).await
     }
     loop {
@@ -419,22 +456,46 @@ async fn send_input(ep: &mut impl EndpointIn) -> ! {
     }
 }
 
-/// IF0 OUT (output report 0x05, PS5 only): not used by the wheel yet; logged.
-async fn log_if0_output(ep: Option<&mut impl EndpointOut>) -> ! {
+/// IF0 OUT (c269 output reports 0x05, 0x30). Relay: to DriveHub. Wheel role: not used
+/// by the wheel yet. Logged when the content changes.
+async fn if0_output(ep: Option<&mut impl EndpointOut>) -> ! {
     let Some(ep) = ep else { pending().await };
     let mut buf = [0u8; MAX_PACKET];
+    let mut last = Packet::new(&[]);
+    let mut repeats = 0u32;
     loop {
         ep.wait_enabled().await;
         while let Ok(n) = ep.read(&mut buf).await {
-            log::info!("{}: IF0 OUT [{}]: {}", PROFILE.name, n, Hex(&buf[..n]));
+            let packet = Packet::new(&buf[..n]);
+            if packet.bytes() == last.bytes() {
+                repeats += 1;
+            } else {
+                log::info!(
+                    "{}: IF0 OUT [{}] (+{} repeats): {}",
+                    PROFILE.name,
+                    n,
+                    repeats,
+                    Hex(packet.bytes())
+                );
+                last = packet;
+                repeats = 0;
+            }
+            if PROFILE.role == Role::Relay && IF0_OUT.try_send(packet).is_err() {
+                count(&STATS.dropped);
+            }
         }
     }
 }
 
-/// Queue → IN endpoint, one report per transfer. A report that exactly fills its last
-/// packet but is shorter than the longest report ([`MAX_PACKET`]) needs a zero-length
-/// packet to end the transfer (e.g. a 20-byte HID++ report on a 20-byte endpoint);
-/// a longest-size report ends by itself.
+/// Queue → IN endpoint.
+///
+/// Relay: one packet per packet received from DriveHub, zero-length ones included (its
+/// endpoints are the same as ours, so its framing is kept as is).
+///
+/// Otherwise one report per transfer. A report that exactly fills its last packet but
+/// is shorter than the longest report ([`MAX_PACKET`]) needs a zero-length packet to end
+/// the transfer (e.g. a 20-byte HID++ report on a 20-byte endpoint); a longest-size
+/// report ends by itself.
 async fn forward_in<const N: usize>(
     ep: &mut impl EndpointIn,
     queue: &'static Channel<CS, Packet, N>,
@@ -445,11 +506,12 @@ async fn forward_in<const N: usize>(
         loop {
             let packet = queue.receive().await;
             let report = packet.bytes();
-            if ep
-                .write_transfer(report, report.len() < MAX_PACKET)
-                .await
-                .is_err()
-            {
+            let written = if PROFILE.role == Role::Relay {
+                ep.write(report).await
+            } else {
+                ep.write_transfer(report, report.len() < MAX_PACKET).await
+            };
+            if written.is_err() {
                 break;
             }
             count(sent);
@@ -501,9 +563,15 @@ impl Handler for Control {
             }
             (RequestType::Class, HID_GET_REPORT) => {
                 let feature = PROFILE.features.iter().find(|f| f[0] == id);
+                let relay_auth = PROFILE.role == Role::Relay
+                    && kind == REPORT_TYPE_FEATURE
+                    && req.index == IF_INPUT;
+                if relay_auth && let Some(n) = auth::get_report(id, buf) {
+                    return Some(InResponse::Accepted(&buf[..n]));
+                }
                 match (kind, id, req.index, feature) {
                     (REPORT_TYPE_FEATURE, _, IF_INPUT, Some(f)) => f,
-                    (REPORT_TYPE_INPUT, 0x01, IF_INPUT, _) if !PROFILE.mirror => {
+                    (REPORT_TYPE_INPUT, 0x01, IF_INPUT, _) if PROFILE.role == Role::Wheel => {
                         let report = input();
                         buf[..report.len()].copy_from_slice(&report);
                         &buf[..report.len()]
@@ -542,8 +610,17 @@ impl Handler for Control {
         if hidpp {
             count(&STATS.hidpp_set_report);
         }
-        // Mirror: every class request goes to the wheel. PS5: only HID++.
-        if PROFILE.mirror || hidpp {
+        let [kind, id] = req.value.to_be_bytes();
+        if PROFILE.role == Role::Relay
+            && req.request == HID_SET_REPORT
+            && req.index == IF_INPUT
+            && kind == REPORT_TYPE_FEATURE
+            && auth::set_report(id, data)
+        {
+            return Some(OutResponse::Accepted);
+        }
+        // Relay and mirror: every class request goes to the backend. Wheel role: HID++.
+        if PROFILE.role != Role::Wheel || hidpp {
             let msg = ControlOut {
                 request: req.request,
                 value: req.value,
@@ -558,7 +635,6 @@ impl Handler for Control {
         match req.request {
             HID_SET_IDLE | HID_SET_PROTOCOL => {}
             HID_SET_REPORT => {
-                let [kind, id] = req.value.to_be_bytes();
                 log::info!(
                     "{}: SET_REPORT IF{} type {} id {:#04x} [{}]: {}",
                     PROFILE.name,

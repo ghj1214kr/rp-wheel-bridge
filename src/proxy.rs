@@ -36,8 +36,8 @@ use embassy_usb_host::descriptor::EndpointDescriptor;
 use embassy_usb_host::handler::EnumerationInfo;
 
 use crate::device::{
-    self, CONTROL_OUT, FFB_IN, FFB_OUT, HID_SET_REPORT, HIDPP_IN, IF_HIDPP, INPUT_IN, PROFILE,
-    Packet, STATS, WHEEL_READY,
+    self, BACKEND_READY, CONTROL_OUT, ControlOut, FFB_IN, FFB_OUT, HID_SET_REPORT, HIDPP_IN,
+    IF_HIDPP, INPUT_IN, PROFILE, Packet, Role, STATS,
 };
 use crate::hid::{Hex, HidInterface, MAX_HID_INTERFACES};
 use crate::usb_host::{ControlPipe, HostBus, open_ep0};
@@ -124,7 +124,7 @@ pub async fn run(
     };
 
     log::info!("proxy: forwarding c272 IF0/IF1/IF2 to the {}", PROFILE.name);
-    WHEEL_READY.signal(());
+    BACKEND_READY.signal(());
     join5(
         forward_input(bus, info, &if0_in),
         forward_in(bus, info, &if1_in, "HID++", |p| {
@@ -162,7 +162,7 @@ async fn forward_input(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDescr
     let mut buf = [0u8; device::MAX_PACKET];
     loop {
         match pipe.request_in(&mut buf).await {
-            Ok(input_map::C272_LEN) if PROFILE.mirror => {
+            Ok(input_map::C272_LEN) if PROFILE.role == Role::Mirror => {
                 count(&WHEEL_INPUT);
                 if INPUT_IN
                     .try_send(Packet::new(&buf[..input_map::C272_LEN]))
@@ -185,8 +185,8 @@ async fn forward_input(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDescr
     }
 }
 
-/// Wheel IN endpoint → queue to the PS device.
-async fn forward_in<E>(
+/// Backend IN endpoint → queue to the native-port device.
+pub(crate) async fn forward_in<E>(
     bus: &HostBus,
     info: &EnumerationInfo,
     ep: &EndpointDescriptor,
@@ -205,7 +205,7 @@ async fn forward_in<E>(
                 }
             }
             Err(e) => {
-                log::warn!("proxy: {} IN failed: {:?}; stopped", name, e);
+                log::warn!("{} IN failed: {:?}; stopped", name, e);
                 return;
             }
         }
@@ -215,7 +215,7 @@ async fn forward_in<E>(
 /// The wheel's EP0: upstream class requests (repeated as the same request), and the
 /// liveness check.
 async fn serve_ep0(ep0: &mut ControlPipe) {
-    if !PROFILE.mirror {
+    if PROFILE.role != Role::Mirror {
         set_idle_all(ep0).await;
         WAKING.store(true, Ordering::Relaxed);
         match WAKE_UP {
@@ -232,35 +232,8 @@ async fn serve_ep0(ep0: &mut ControlPipe) {
     loop {
         match select(CONTROL_OUT.receive(), ticker.next()).await {
             Either::First(msg) => {
-                let data = msg.data.bytes();
-                let hidpp = msg.request == HID_SET_REPORT && msg.index == IF_HIDPP;
-                if hidpp && msg.value == HIDPP_SHORT_OUTPUT {
-                    log_hidpp("upstream -> wheel", data);
-                } else {
-                    log::debug!(
-                        "control upstream -> wheel: request {:#04x} value {:#06x} IF{} [{}]: {}",
-                        msg.request,
-                        msg.value,
-                        msg.index,
-                        data.len(),
-                        Hex(data)
-                    );
-                }
-                let setup = SetupPacket::class_interface_out(
-                    msg.request,
-                    msg.value,
-                    msg.index,
-                    data.len() as u16,
-                );
-                match ep0.control_out(&setup.to_bytes(), data).await {
-                    Ok(()) if hidpp => count(&HIDPP_WRITTEN),
-                    Ok(()) => {}
-                    Err(e) => log::warn!(
-                        "proxy: request {:#04x} IF{} to wheel failed: {:?}",
-                        msg.request,
-                        msg.index,
-                        e
-                    ),
+                if repeat_control(ep0, &msg, "upstream -> wheel").await {
+                    count(&HIDPP_WRITTEN);
                 }
             }
             Either::Second(()) => {
@@ -279,16 +252,62 @@ async fn serve_ep0(ep0: &mut ControlPipe) {
     }
 }
 
+/// Repeat an upstream class request to the backend, logged as `direction`. Returns
+/// whether it was a HID++ request that went through.
+pub(crate) async fn repeat_control(
+    ep0: &mut ControlPipe,
+    msg: &ControlOut,
+    direction: &str,
+) -> bool {
+    let data = msg.data.bytes();
+    let hidpp = msg.request == HID_SET_REPORT && msg.index == IF_HIDPP;
+    if hidpp && msg.value == HIDPP_SHORT_OUTPUT {
+        log_hidpp(direction, data);
+    } else {
+        log::debug!(
+            "control {}: request {:#04x} value {:#06x} IF{} [{}]: {}",
+            direction,
+            msg.request,
+            msg.value,
+            msg.index,
+            data.len(),
+            Hex(data)
+        );
+    }
+    let setup =
+        SetupPacket::class_interface_out(msg.request, msg.value, msg.index, data.len() as u16);
+    match ep0.control_out(&setup.to_bytes(), data).await {
+        Ok(()) => hidpp,
+        Err(e) => {
+            log::warn!(
+                "request {:#04x} IF{} ({}) failed: {:?}",
+                msg.request,
+                msg.index,
+                direction,
+                e
+            );
+            false
+        }
+    }
+}
+
 /// Force feedback from upstream → wheel EP 0x03.
+///
+/// The PS5 sends report 0x01 cut short (7-12 bytes, relay capture); DriveHub pads it
+/// with zeros to the declared 64 bytes before giving it to the wheel, and so does this.
 async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDescriptor) {
     let Some(mut pipe) = open::<pipe::Out>(bus, info, ep) else {
         return;
     };
     let mut sampler = Sampler::new();
+    let mut report = [0u8; device::MAX_PACKET];
     loop {
         let packet = FFB_OUT.receive().await;
-        sampler.log("FFB upstream -> wheel", packet.bytes());
-        match pipe.request_out(packet.bytes(), false).await {
+        let data = packet.bytes();
+        sampler.log("FFB upstream -> wheel", data);
+        report.fill(0);
+        report[..data.len()].copy_from_slice(data);
+        match pipe.request_out(&report, false).await {
             Ok(()) => count(&FFB_WRITTEN),
             Err(e) => {
                 log::warn!("proxy: FFB OUT failed: {:?}; stopped", e);
@@ -298,7 +317,7 @@ async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDes
     }
 }
 
-fn open<D: pipe::Direction>(
+pub(crate) fn open<D: pipe::Direction>(
     bus: &HostBus,
     info: &EnumerationInfo,
     ep: &EndpointDescriptor,
@@ -310,11 +329,7 @@ fn open<D: pipe::Direction>(
     ) {
         Ok(p) => Some(p),
         Err(e) => {
-            log::warn!(
-                "proxy: cannot open endpoint {:#04x}: {:?}",
-                ep.endpoint_address,
-                e
-            );
+            log::warn!("cannot open endpoint {:#04x}: {:?}", ep.endpoint_address, e);
             None
         }
     }
@@ -396,27 +411,27 @@ fn hidpp_short_setup() -> [u8; 8] {
 }
 
 /// One HID++ message, trailing zero padding left out (the length is the full one).
-fn log_hidpp(direction: &str, msg: &[u8]) {
+pub(crate) fn log_hidpp(direction: &str, msg: &[u8]) {
     let used = msg.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     log::debug!("HID++ {} [{}]: {}", direction, msg.len(), Hex(&msg[..used]));
 }
 
 /// Logs a high-rate stream at most once per [`FFB_LOG_INTERVAL`], with the number of
 /// packets since the previous logged one.
-struct Sampler {
+pub(crate) struct Sampler {
     last: Option<Instant>,
     skipped: u32,
 }
 
 impl Sampler {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             last: None,
             skipped: 0,
         }
     }
 
-    fn log(&mut self, what: &str, packet: &[u8]) {
+    pub(crate) fn log(&mut self, what: &str, packet: &[u8]) {
         let now = Instant::now();
         if self.last.is_some_and(|t| now - t < FFB_LOG_INTERVAL) {
             self.skipped += 1;

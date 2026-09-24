@@ -43,7 +43,8 @@ use embassy_usb_host::{BusRoute, BusState, EnumerationError};
 use rp_pio_usb_host::{Bus, PioPipe, PioUsbAllocator, PioUsbController, Pulldown};
 use static_cell::StaticCell;
 
-use crate::{hid, proxy};
+use crate::device::{PROFILE, Role};
+use crate::{hid, proxy, relay};
 
 type HostController =
     embassy_usb_host::BusController<'static, PioUsbController<'static, 'static, PIO0>>;
@@ -129,10 +130,15 @@ pub async fn host_task(bus: &'static Bus<'static, PIO0>) {
         if !is_wheel {
             hid::probe(&bus, &info, &ifaces).await;
         }
+        let is_relay_backend = PROFILE.role == Role::Relay
+            && (d.vendor_id, d.product_id) == (relay::BACKEND_VID, relay::BACKEND_PID);
         let serve = async {
             if is_wheel {
                 proxy::run(&bus, &info, &ifaces).await;
                 log::warn!("proxy stopped");
+            } else if is_relay_backend {
+                relay::run(&bus, &info, &ifaces).await;
+                log::warn!("relay stopped");
             } else {
                 log::info!("monitoring HID input reports (changes only)...");
                 hid::monitor(&bus, &info, &ifaces).await;

@@ -1,0 +1,275 @@
+//! PS4/PS5 peripheral authentication relay: IF0 feature reports F0-F3, answered to the
+//! console from a cache that the host side fills from a device that can sign (now
+//! DriveHub; later the licensed auth pad).
+//!
+//! Report layout (GP2040-CE / jfedor2 wheel-adapter, also used by the earlier
+//! ps5-wheel-passthrough project):
+//! - F3 (GET, 7 bytes + ID): auth reset / sizes, e.g. `00 38 38 00 00 00 00`.
+//! - F0 (SET, 63 + ID) ×5: `F0 <nonce id> <page 0..4> 00 <56 bytes> <4 bytes>`.
+//! - F2 (GET, 15 + ID): `F2 <nonce id> <0x10 signing | 0x00 ready> 00 ...`.
+//! - F1 (GET, 63 + ID) ×19: `F1 <nonce id> <page 0..18> 00 <56 bytes> ...`.
+//!
+//! The console's GET_REPORTs must be answered on the spot (embassy-usb control handlers
+//! are synchronous), so the relay leans on the console polling F2: nonce pages go to
+//! the signer as they arrive, and until all signature pages are fetched from it the
+//! console is told "signing". Only that busy F2 is made up here; everything else is the
+//! signer's own bytes.
+
+use core::cell::RefCell;
+
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_time::{Duration, Instant, Timer};
+use embassy_usb_driver::host::UsbPipe;
+use embassy_usb_host::control::SetupPacket;
+
+use crate::device::Packet;
+use crate::hid::Hex;
+use crate::usb_host::ControlPipe;
+
+pub const ID_NONCE: u8 = 0xf0;
+pub const ID_SIGNATURE: u8 = 0xf1;
+pub const ID_STATE: u8 = 0xf2;
+pub const ID_RESET: u8 = 0xf3;
+
+/// Report lengths, report ID included.
+const SIGNATURE_LEN: usize = 64;
+const STATE_LEN: usize = 16;
+const RESET_LEN: usize = 8;
+
+const LAST_NONCE_PAGE: u8 = 4;
+const SIGNATURE_PAGES: usize = 19;
+
+/// F2 byte 2.
+const STATE_SIGNING: u8 = 0x10;
+const STATE_READY: u8 = 0x00;
+
+/// How often the signer's F2 is polled, and for how long.
+const SIGNER_POLL: Duration = Duration::from_millis(20);
+const SIGNER_TIMEOUT: Duration = Duration::from_secs(10);
+
+const HID_GET_REPORT: u8 = 0x01;
+const HID_SET_REPORT: u8 = 0x09;
+const REPORT_TYPE_FEATURE: u16 = 0x03;
+const IF_AUTH: u16 = 0;
+
+type CS = CriticalSectionRawMutex;
+
+struct State {
+    /// The signer's F3 answer.
+    reset: Option<[u8; RESET_LEN]>,
+    nonce_id: u8,
+    /// Signature pages fetched and the signer's final F2 cached.
+    ready: bool,
+    ready_state: [u8; STATE_LEN],
+    signature: [[u8; SIGNATURE_LEN]; SIGNATURE_PAGES],
+    /// Next F1 page to hand to the console.
+    next_page: usize,
+}
+
+static STATE: Mutex<CS, RefCell<State>> = Mutex::new(RefCell::new(State {
+    reset: None,
+    nonce_id: 0,
+    ready: false,
+    ready_state: [0; STATE_LEN],
+    signature: [[0; SIGNATURE_LEN]; SIGNATURE_PAGES],
+    next_page: 0,
+}));
+
+/// Console-side events for the host side to act on.
+pub enum Cmd {
+    /// The console read F3: reset the signer too.
+    Reset,
+    /// One nonce page (F0 report, ID included).
+    Nonce(Packet),
+}
+
+pub static CMD: Channel<CS, Cmd, 8> = Channel::new();
+
+// ---- console side (core 0, inside the synchronous control handler) ----
+
+/// GET_REPORT(Feature) for F1/F2/F3 into `buf`. `None`: not an auth report, or nothing
+/// to answer with (the request is then rejected).
+pub fn get_report(id: u8, buf: &mut [u8]) -> Option<usize> {
+    STATE.lock(|s| {
+        let mut s = s.borrow_mut();
+        match id {
+            ID_RESET => {
+                s.ready = false;
+                s.next_page = 0;
+                send(Cmd::Reset);
+                let reset = s.reset?;
+                buf[..RESET_LEN].copy_from_slice(&reset);
+                log::info!("auth: console GET F3 -> {}", Hex(&reset));
+                Some(RESET_LEN)
+            }
+            ID_STATE => {
+                if s.ready {
+                    buf[..STATE_LEN].copy_from_slice(&s.ready_state);
+                } else {
+                    buf[..STATE_LEN].fill(0);
+                    buf[0] = ID_STATE;
+                    buf[1] = s.nonce_id;
+                    buf[2] = STATE_SIGNING;
+                }
+                log::debug!("auth: console GET F2 -> {}", Hex(&buf[..3]));
+                Some(STATE_LEN)
+            }
+            ID_SIGNATURE => {
+                if !s.ready || s.next_page >= SIGNATURE_PAGES {
+                    log::warn!(
+                        "auth: console GET F1 with no signature page (ready {}, page {})",
+                        s.ready,
+                        s.next_page
+                    );
+                    return None;
+                }
+                let page = s.next_page;
+                buf[..SIGNATURE_LEN].copy_from_slice(&s.signature[page]);
+                s.next_page += 1;
+                log::debug!("auth: console GET F1 page {}", page);
+                Some(SIGNATURE_LEN)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// SET_REPORT(Feature) F0 (report ID included). Returns false for other reports.
+pub fn set_report(id: u8, data: &[u8]) -> bool {
+    if id != ID_NONCE {
+        return false;
+    }
+    STATE.lock(|s| {
+        let mut s = s.borrow_mut();
+        s.ready = false;
+        s.next_page = 0;
+        s.nonce_id = data.get(1).copied().unwrap_or(0);
+    });
+    log::info!(
+        "auth: console SET F0 nonce id {} page {}",
+        data.get(1).copied().unwrap_or(0),
+        data.get(2).copied().unwrap_or(0)
+    );
+    send(Cmd::Nonce(Packet::new(data)));
+    true
+}
+
+fn send(cmd: Cmd) {
+    if CMD.try_send(cmd).is_err() {
+        log::warn!("auth: command queue full; dropped");
+    }
+}
+
+// ---- signer side (core 1, the host's control pipe to the signing device) ----
+
+/// Read the signer's F3 before the console connects, so the first console F3 can be
+/// answered.
+pub async fn prefetch(ep0: &mut ControlPipe) {
+    let mut buf = [0u8; RESET_LEN];
+    match get_feature(ep0, ID_RESET, &mut buf).await {
+        Some(n) => {
+            log::info!("auth: signer F3 = {}", Hex(&buf[..n]));
+            STATE.lock(|s| s.borrow_mut().reset = Some(buf));
+        }
+        None => log::warn!("auth: signer F3 unreadable; console F3 will be rejected"),
+    }
+}
+
+/// Act on one console event.
+pub async fn handle(cmd: Cmd, ep0: &mut ControlPipe) {
+    match cmd {
+        Cmd::Reset => {
+            let mut buf = [0u8; RESET_LEN];
+            if let Some(n) = get_feature(ep0, ID_RESET, &mut buf).await {
+                log::info!("auth: signer F3 (reset) = {}", Hex(&buf[..n]));
+            }
+        }
+        Cmd::Nonce(page) => {
+            let data = page.bytes();
+            let setup = SetupPacket::class_interface_out(
+                HID_SET_REPORT,
+                REPORT_TYPE_FEATURE << 8 | u16::from(ID_NONCE),
+                IF_AUTH,
+                data.len() as u16,
+            );
+            if let Err(e) = ep0.control_out(&setup.to_bytes(), data).await {
+                log::warn!("auth: signer SET F0 failed: {:?}", e);
+                return;
+            }
+            log::debug!("auth: signer SET F0 [{}]: {}", data.len(), Hex(data));
+            if data.get(2) == Some(&LAST_NONCE_PAGE) {
+                fetch_signature(ep0).await;
+            }
+        }
+    }
+}
+
+/// Poll the signer's F2 until it is ready, then fetch every F1 page and publish them.
+async fn fetch_signature(ep0: &mut ControlPipe) {
+    let start = Instant::now();
+    let mut state = [0u8; STATE_LEN];
+    let mut last = [0xffu8; 3];
+    loop {
+        if start.elapsed() >= SIGNER_TIMEOUT {
+            log::warn!(
+                "auth: signer not ready after {} s",
+                SIGNER_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        if get_feature(ep0, ID_STATE, &mut state).await.is_some() {
+            if state[..3] != last {
+                log::info!(
+                    "auth: signer F2 = {} ({} ms)",
+                    Hex(&state),
+                    start.elapsed().as_millis()
+                );
+                last.copy_from_slice(&state[..3]);
+            }
+            if state[2] == STATE_READY {
+                break;
+            }
+        }
+        Timer::after(SIGNER_POLL).await;
+    }
+
+    let mut pages = [[0u8; SIGNATURE_LEN]; SIGNATURE_PAGES];
+    for (i, page) in pages.iter_mut().enumerate() {
+        if get_feature(ep0, ID_SIGNATURE, page).await.is_none() {
+            log::warn!("auth: signer F1 page {} unreadable", i);
+            return;
+        }
+        log::debug!("auth: signer F1 [{}]: {}", i, Hex(page));
+    }
+    STATE.lock(|s| {
+        let mut s = s.borrow_mut();
+        s.signature = pages;
+        s.ready_state = state;
+        s.next_page = 0;
+        s.ready = true;
+    });
+    log::info!(
+        "auth: signature cached ({} pages, {} ms)",
+        SIGNATURE_PAGES,
+        start.elapsed().as_millis()
+    );
+}
+
+/// GET_REPORT(Feature, `id`) on IF0 into `buf`; `None` on failure (logged).
+async fn get_feature(ep0: &mut ControlPipe, id: u8, buf: &mut [u8]) -> Option<usize> {
+    let setup = SetupPacket::class_interface_in(
+        HID_GET_REPORT,
+        REPORT_TYPE_FEATURE << 8 | u16::from(id),
+        IF_AUTH,
+        buf.len() as u16,
+    );
+    match ep0.control_in(&setup.to_bytes(), buf).await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            log::warn!("auth: signer GET {:#04x} failed: {:?}", id, e);
+            None
+        }
+    }
+}
