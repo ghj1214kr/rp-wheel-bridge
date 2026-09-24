@@ -44,8 +44,10 @@ The bridge uses a fork (branch `sof-during-transfers`) with:
 - **SOFs during transfers**, and transfers kept clear of the frame boundary.
 - **Stage-by-stage control transfers:** SETUP is resent only without an ACK. Resending
   an ACKed SETUP restarts the request (a hub's port reset never completed).
+- **No interrupts from token to reply** on core 1, and long packets started without
+  the cross-core critical section ([below](#lost-handshakes)).
 - **Bus release after each packet:** if D+/D- are still driven 2 µs after a packet's
-  EOP, the host releases them itself ([below](#the-held-bus)).
+  EOP, the host releases them itself (a safety net).
 - **Diagnostics:** counters for these releases and for OUT/SETUP handshake outcomes
   (`rp_pio_usb_host::diag::take()`); the bridge logs them in its 5 s statistics
   when anything besides missed handshakes shows up.
@@ -61,7 +63,7 @@ reset. The fix keeps SM0 disabled whenever it is idle (after each packet, and af
 bus reset). Found with a loopback capture of our own SOF and a probe of the PIO pad
 debug registers.
 
-### The held bus
+### Lost handshakes
 
 The wheel dropped out of force feedback about once every half hour to hour: its
 force feedback stopped, steering stopped working in the game, and its control
@@ -77,14 +79,29 @@ that STALL, showed what happened:
   after ~0.5 s it switched its force feedback off (`12 ff 1f 00 20`) and announced
   its rotation again, as at power-up.
 
-The host was still driving the bus after its packets. The TX player releases D+/D-
-right after EOP, and the IN path releases them explicitly before a reply; the
-OUT/SETUP path relied on the player alone, waited up to 50 µs for the release and
-then went on with the bus held, so the device's handshake collided with our idle J.
-The fork now releases the bus itself when it is still driven 2 µs after EOP. In a
-54-minute drive it had to do so 586 times (up to 15 times in 5 s), and the wheel
-never dropped out; before, it was a matter of time. What keeps the pins driven is
-not known yet (a suspect: the hardware SOF state machine on the same pins).
+Two causes, both on core 1 between a packet and its reply:
+
+- **The frame-timer interrupt.** With hardware SOFs it fires 20 µs after each
+  boundary to prepare the next SOF and, while a transfer holds the bus, retries every
+  20 µs. Landing between our EOP and the moment RX is let loose, it made the host miss
+  the handshake, which follows within a microsecond. A packet retried at the same
+  point of the frame could keep hitting it, hence the endless resending. The fork now
+  keeps core 1's interrupts off from the token through the reply (and our ACK of IN
+  data): at most ~0.1 ms, the SOF itself being sent by hardware. The frame guard is
+  checked again inside, or an interrupt just before could push the transaction over
+  the boundary (the host then read its own SOF as the reply).
+- **A late DATA packet.** A device drops an OUT/SETUP whose DATA does not follow the
+  token within about a microsecond, and sends no handshake. On the sniffer every
+  unanswered OUT had 4-16 µs from its token to its DATA (2-4 µs for the ACKed ones).
+  Long packets were started inside `critical_section::with`: a call into flash and
+  the cross-core spinlock, which core 0 may hold. It is local interrupt masking now.
+
+Before the fix, the host also counted "bus still driven after TX" a few times a
+minute; a PIO snapshot at each one showed the bus already released: the check had
+been interrupted. The fork still releases the bus itself if it is driven 2 µs after
+EOP, as a safety net. Missed OUT/SETUP handshakes while streaming force feedback went
+from ~18/s to ~5/s, and the auth pad's page losses (and with them most re-signing)
+went away.
 
 ## Hub
 
@@ -149,14 +166,16 @@ wheel base (the bridge talks to 0xff).
 
 ## Known issues
 
-- **Missed handshakes:** tens per second, the host gets no handshake after an OUT
-  or SETUP; the transaction is retried. Possibly related to [the held
-  bus](#the-held-bus); not investigated yet.
-- **Sporadic bus errors:** now and then a garbled handshake read as STALL (FFB IN,
-  IF0 IN, the 1 s GET_STATUS liveness check) or a lost OCTA reply. All are recovered
-  automatically: IN endpoints are polled on, FFB OUT drops just the packet, auth signs
-  again. Many of them were probably [the held bus](#the-held-bus).
-- **Wheel dropping out of force feedback:** fixed, see [the held bus](#the-held-bus).
+- **Missed handshakes:** ~5 per second while force feedback streams, the host gets
+  no handshake after an OUT or SETUP; the transaction is retried. Most likely more
+  late DATA packets (see [lost handshakes](#lost-handshakes)); sending token and DATA
+  as one PIO stream would rule that out.
+- **Sporadic bus errors:** now and then a garbled reply or a lost auth pad reply.
+  All are recovered automatically: IN endpoints are polled on, FFB OUT drops just the
+  packet, auth signs again. Most of the earlier ones were [lost
+  handshakes](#lost-handshakes).
+- **Wheel dropping out of force feedback:** fixed, see [lost
+  handshakes](#lost-handshakes).
   Should it still happen (the wheel STALLs FFB OUT), the bridge clears the halt and
   replays the console's FFB set-up. It logs pauses over 100 ms in the FFB streams and
   FFB packets taking over 20 ms to reach the wheel.

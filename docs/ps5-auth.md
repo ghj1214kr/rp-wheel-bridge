@@ -68,7 +68,7 @@ signer's own bytes (with the nonce id rewritten, below).
   the previous signing. The bridge believes "ready" only after it has seen
   "signing" (or after 0.5 s).
 - **Refusals:** it now and then STALLs or times out a SET F0 (at least some of the
-  STALLs were the host's own doing, see [usb-host.md](usb-host.md#the-held-bus)). The refused page is
+  STALLs were the host's own doing, see [usb-host.md](usb-host.md#lost-handshakes)). The refused page is
   sent again with all the others once the last page is in.
 - **Overload:** after many signings in a row (10 attempts per round) it once stayed
   "signing" for good, round after round, until it was unplugged. Hence the low

@@ -60,7 +60,8 @@ const STATS_INTERVAL: Duration = Duration::from_secs(5);
 /// Force feedback recovery. If the wheel stops taking force feedback, it STALLs its FFB
 /// OUT endpoint and notifies `12 ff 1f 00 20`, and the console, which sets force
 /// feedback up only once, loses it for good. The one cause seen so far was the host
-/// holding the bus after its packets (fixed in rp-pio-usb-host; docs/usb-host.md).
+/// missing the wheel's handshakes and resending one packet (fixed in rp-pio-usb-host;
+/// docs/usb-host.md, "Lost handshakes").
 /// The FFB OUT task then asks [`serve_ep0`] to clear the endpoint halt
 /// ([`FFB_RECOVER`], answered through [`FFB_HALT_CLEARED`]) and replays the console's
 /// FFB set-up commands to the wheel.
