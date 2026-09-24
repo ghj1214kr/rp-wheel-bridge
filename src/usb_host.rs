@@ -121,10 +121,14 @@ pub async fn host_task(bus: &'static Bus<'static, PIO0>) {
             enumerate_with_retry(&mut ctrl, &bus, speed, &mut config_buf).await;
 
         let ifaces = hid::find_interfaces(&config_buf[..config_len]);
-        hid::probe(&bus, &info, &ifaces).await;
-
         let d = &info.device_desc;
         let is_wheel = (d.vendor_id, d.product_id) == (proxy::WHEEL_VID, proxy::WHEEL_PID);
+        // Not for the wheel: its descriptors are known, and it wants host software to
+        // talk to it right after SET_CONFIGURATION (see `proxy`); the probe's ~0.5 s of
+        // descriptor reads and log pauses made it switch off about half the time.
+        if !is_wheel {
+            hid::probe(&bus, &info, &ifaces).await;
+        }
         let serve = async {
             if is_wheel {
                 proxy::run(&bus, &info, &ifaces).await;

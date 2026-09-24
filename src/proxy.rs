@@ -1,20 +1,28 @@
 //! Host side of the bridge: the G Pro Xbox/PC (c272) on the USB-A port, forwarded to
-//! the PS device ([`crate::ps_device`]) on the native port.
+//! the native-port device ([`crate::device`]); "upstream" below is whatever drives that
+//! device (the PS5, or in mirror mode the wheel's host, e.g. DriveHub).
 //!
-//! - IF0 input (EP 0x81, 30 bytes) is translated ([`crate::input_map`]); the only
-//!   interface whose format differs.
+//! - IF0 input (EP 0x81, 30 bytes): translated for the PS5 ([`crate::input_map`]), the
+//!   only interface whose format differs; forwarded unchanged in mirror mode.
 //! - IF1 HID++ (EP 0x82 IN, SET_REPORT on EP0) and IF2 force feedback (EP 0x83 IN,
 //!   EP 0x03 OUT) carry the same reports on both sides and are forwarded unchanged.
-//!   HID++ messages are logged in both directions.
+//!   HID++ messages are logged in both directions, force feedback sampled.
+//! - Upstream class control requests (HID++ SET_REPORT; in mirror mode all of them) are
+//!   repeated to the wheel.
 //! - The wheel is checked once a second with GET_STATUS: with R13 fitted a detach is
 //!   never seen, so this is the only way to notice it switching off.
 //!
-//! A freshly booted wheel switches itself off about 2 s after enumeration unless host
-//! software talks HID++ to it (G HUB does; the PS5 never uses IF1). What seems to count
-//! is a request still pending when the wheel finishes booting (~0.3 s after the proxy
-//! starts): a single ping or pings 400 ms apart missed that moment and the wheel went
-//! off, while G HUB's burst of four requests (replayed from [`crate::ghub_init`]) kept it
-//! on. See [`WakeUp`]. The wheel's answers during the wake-up are logged, not forwarded.
+//! The wheel switches itself off about 2 s after enumeration unless host software talks
+//! to it early (G HUB and DriveHub do; the PS5 never uses IF1). DriveHub, seen through
+//! the mirror, sends SET_IDLE(0) to the three interfaces and its first HID++ request
+//! within 15 ms of SET_CONFIGURATION, and the wheel stayed on even when freshly booted;
+//! the bridge used to start ~470 ms later (after a descriptor dump) and the wheel stayed
+//! on only about half the time, with G HUB's requests as with the bridge's own. So the
+//! proxy starts right after enumeration and, for the PS5, does what DriveHub does:
+//! SET_IDLE, then HID++ ([`WakeUp`]). The wheel's answers during the wake-up are logged,
+//! not forwarded.
+//! Mirror mode sends nothing of its own: finding out what the wheel's host sends is the
+//! point of it.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -22,24 +30,29 @@ use embassy_futures::join::{join, join5};
 use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use embassy_usb_driver::EndpointInfo;
-use embassy_usb_driver::host::{UsbHostAllocator, UsbPipe, pipe};
+use embassy_usb_driver::host::{PipeError, UsbHostAllocator, UsbPipe, pipe};
 use embassy_usb_host::control::SetupPacket;
 use embassy_usb_host::descriptor::EndpointDescriptor;
 use embassy_usb_host::handler::EnumerationInfo;
 
+use crate::device::{
+    self, CONTROL_OUT, FFB_IN, FFB_OUT, HID_SET_REPORT, HIDPP_IN, IF_HIDPP, INPUT_IN, PROFILE,
+    Packet, STATS, WHEEL_READY,
+};
 use crate::hid::{Hex, HidInterface, MAX_HID_INTERFACES};
-use crate::ps_device::{self, FFB_IN, FFB_OUT, HIDPP_IN, HIDPP_OUT, Packet, STATS};
 use crate::usb_host::{ControlPipe, HostBus, open_ep0};
 use crate::{ghub_init, input_map};
 
 pub const WHEEL_VID: u16 = 0x046d;
 pub const WHEEL_PID: u16 = 0xc272;
 
-const IF_INPUT: u8 = 0;
-const IF_HIDPP: u8 = 1;
-const IF_FFB: u8 = 2;
+const IF_INPUT: u16 = 0;
+const IF_FFB: u16 = 2;
 
-const HID_SET_REPORT: u8 = 0x09;
+const HID_SET_IDLE: u8 = 0x0a;
+
+/// Force feedback runs at up to 1 kHz; log at most one packet per direction this often.
+const FFB_LOG_INTERVAL: Duration = Duration::from_millis(100);
 
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -79,7 +92,7 @@ static WAKING: AtomicBool = AtomicBool::new(false);
 /// Set when the wheel answers a request (not a notification) during the wake-up.
 static WHEEL_ANSWERED: AtomicBool = AtomicBool::new(false);
 
-/// Wheel-side counters (the device side's are in [`ps_device::STATS`]).
+/// Wheel-side counters (the device side's are in [`device::STATS`]).
 static WHEEL_INPUT: AtomicU32 = AtomicU32::new(0);
 static WHEEL_HIDPP: AtomicU32 = AtomicU32::new(0);
 static WHEEL_FFB: AtomicU32 = AtomicU32::new(0);
@@ -93,7 +106,7 @@ pub async fn run(
     info: &EnumerationInfo,
     ifaces: &[Option<HidInterface>; MAX_HID_INTERFACES],
 ) {
-    let find = |n| ifaces.iter().flatten().find(|i| i.number == n);
+    let find = |n| ifaces.iter().flatten().find(|i| u16::from(i.number) == n);
     let (Some(if0_in), Some(if1_in), Some((if2_in, if2_out))) = (
         find(IF_INPUT).and_then(|i| i.in_ep),
         find(IF_HIDPP).and_then(|i| i.in_ep),
@@ -110,7 +123,8 @@ pub async fn run(
         }
     };
 
-    log::info!("proxy: forwarding c272 IF0/IF1/IF2 to the PS device");
+    log::info!("proxy: forwarding c272 IF0/IF1/IF2 to the {}", PROFILE.name);
+    WHEEL_READY.signal(());
     join5(
         forward_input(bus, info, &if0_in),
         forward_in(bus, info, &if1_in, "HID++", |p| {
@@ -123,13 +137,17 @@ pub async fn run(
                 }
                 return Ok(());
             }
-            log_hidpp("wheel -> console", p.bytes());
+            log_hidpp("wheel -> upstream", p.bytes());
             HIDPP_IN.try_send(p)
         }),
         serve_ep0(&mut ep0),
-        forward_in(bus, info, &if2_in, "FFB", |p| {
-            count(&WHEEL_FFB);
-            FFB_IN.try_send(p)
+        forward_in(bus, info, &if2_in, "FFB", {
+            let mut sampler = Sampler::new();
+            move |p| {
+                count(&WHEEL_FFB);
+                sampler.log("FFB wheel -> upstream", p.bytes());
+                FFB_IN.try_send(p)
+            }
         }),
         join(forward_ffb_out(bus, info, &if2_out), log_stats()),
     )
@@ -141,13 +159,22 @@ async fn forward_input(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDescr
     let Some(mut pipe) = open::<pipe::In>(bus, info, ep) else {
         return;
     };
-    let mut buf = [0u8; ps_device::MAX_PACKET];
+    let mut buf = [0u8; device::MAX_PACKET];
     loop {
         match pipe.request_in(&mut buf).await {
+            Ok(input_map::C272_LEN) if PROFILE.mirror => {
+                count(&WHEEL_INPUT);
+                if INPUT_IN
+                    .try_send(Packet::new(&buf[..input_map::C272_LEN]))
+                    .is_err()
+                {
+                    device::count(&STATS.dropped);
+                }
+            }
             Ok(input_map::C272_LEN) => {
                 count(&WHEEL_INPUT);
                 let report = buf[..input_map::C272_LEN].try_into().unwrap();
-                ps_device::set_input(input_map::translate(report));
+                device::set_input(input_map::translate(report));
             }
             Ok(n) => log::warn!("proxy: IF0 report of {} bytes ignored", n),
             Err(e) => {
@@ -169,12 +196,12 @@ async fn forward_in<E>(
     let Some(mut pipe) = open::<pipe::In>(bus, info, ep) else {
         return;
     };
-    let mut buf = [0u8; ps_device::MAX_PACKET];
+    let mut buf = [0u8; device::MAX_PACKET];
     loop {
         match pipe.request_in(&mut buf).await {
             Ok(n) => {
                 if push(Packet::new(&buf[..n])).is_err() {
-                    ps_device::count(&STATS.dropped);
+                    device::count(&STATS.dropped);
                 }
             }
             Err(e) => {
@@ -185,35 +212,55 @@ async fn forward_in<E>(
     }
 }
 
-/// The wheel's EP0: HID++ SET_REPORTs from the console (forwarded as the same request
-/// to IF1), and the liveness check.
+/// The wheel's EP0: upstream class requests (repeated as the same request), and the
+/// liveness check.
 async fn serve_ep0(ep0: &mut ControlPipe) {
-    WAKING.store(true, Ordering::Relaxed);
-    match WAKE_UP {
-        WakeUp::RapidPing => ping_until_answered(ep0).await,
-        WakeUp::GHubReplay => replay_ghub_init(ep0).await,
+    if !PROFILE.mirror {
+        set_idle_all(ep0).await;
+        WAKING.store(true, Ordering::Relaxed);
+        match WAKE_UP {
+            WakeUp::RapidPing => ping_until_answered(ep0).await,
+            WakeUp::GHubReplay => replay_ghub_init(ep0).await,
+        }
+        // Let the last answers arrive before forwarding resumes.
+        Timer::after_millis(100).await;
+        WAKING.store(false, Ordering::Relaxed);
     }
-    // Let the last answers arrive before forwarding resumes.
-    Timer::after_millis(100).await;
-    WAKING.store(false, Ordering::Relaxed);
 
     let mut ticker = Ticker::every(LIVENESS_INTERVAL);
     let mut responding = true;
     loop {
-        match select(HIDPP_OUT.receive(), ticker.next()).await {
+        match select(CONTROL_OUT.receive(), ticker.next()).await {
             Either::First(msg) => {
                 let data = msg.data.bytes();
-                log::debug!("HID++ console -> wheel: wValue {:#06x}", msg.value);
-                log_hidpp("console -> wheel", data);
+                let hidpp = msg.request == HID_SET_REPORT && msg.index == IF_HIDPP;
+                if hidpp && msg.value == HIDPP_SHORT_OUTPUT {
+                    log_hidpp("upstream -> wheel", data);
+                } else {
+                    log::debug!(
+                        "control upstream -> wheel: request {:#04x} value {:#06x} IF{} [{}]: {}",
+                        msg.request,
+                        msg.value,
+                        msg.index,
+                        data.len(),
+                        Hex(data)
+                    );
+                }
                 let setup = SetupPacket::class_interface_out(
-                    HID_SET_REPORT,
+                    msg.request,
                     msg.value,
-                    u16::from(IF_HIDPP),
+                    msg.index,
                     data.len() as u16,
                 );
                 match ep0.control_out(&setup.to_bytes(), data).await {
-                    Ok(()) => count(&HIDPP_WRITTEN),
-                    Err(e) => log::warn!("proxy: HID++ SET_REPORT to wheel failed: {:?}", e),
+                    Ok(()) if hidpp => count(&HIDPP_WRITTEN),
+                    Ok(()) => {}
+                    Err(e) => log::warn!(
+                        "proxy: request {:#04x} IF{} to wheel failed: {:?}",
+                        msg.request,
+                        msg.index,
+                        e
+                    ),
                 }
             }
             Either::Second(()) => {
@@ -232,13 +279,15 @@ async fn serve_ep0(ep0: &mut ControlPipe) {
     }
 }
 
-/// Force feedback from the console → wheel EP 0x03.
+/// Force feedback from upstream → wheel EP 0x03.
 async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDescriptor) {
     let Some(mut pipe) = open::<pipe::Out>(bus, info, ep) else {
         return;
     };
+    let mut sampler = Sampler::new();
     loop {
         let packet = FFB_OUT.receive().await;
+        sampler.log("FFB upstream -> wheel", packet.bytes());
         match pipe.request_out(packet.bytes(), false).await {
             Ok(()) => count(&FFB_WRITTEN),
             Err(e) => {
@@ -267,6 +316,18 @@ fn open<D: pipe::Direction>(
                 e
             );
             None
+        }
+    }
+}
+
+/// SET_IDLE(0) on the wheel's three interfaces, as DriveHub starts. HID 1.11 §7.2.4
+/// makes the request optional, so a STALL is fine.
+async fn set_idle_all(ep0: &mut ControlPipe) {
+    for iface in [IF_INPUT, IF_HIDPP, IF_FFB] {
+        let setup = SetupPacket::class_interface_out(HID_SET_IDLE, 0, iface, 0);
+        match ep0.control_out(&setup.to_bytes(), &[]).await {
+            Ok(()) | Err(PipeError::Stall) => {}
+            Err(e) => log::warn!("proxy: SET_IDLE IF{} failed: {:?}", iface, e),
         }
     }
 }
@@ -328,7 +389,7 @@ fn hidpp_short_setup() -> [u8; 8] {
     SetupPacket::class_interface_out(
         HID_SET_REPORT,
         HIDPP_SHORT_OUTPUT,
-        u16::from(IF_HIDPP),
+        IF_HIDPP,
         PING.len() as u16,
     )
     .to_bytes()
@@ -338,6 +399,40 @@ fn hidpp_short_setup() -> [u8; 8] {
 fn log_hidpp(direction: &str, msg: &[u8]) {
     let used = msg.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     log::debug!("HID++ {} [{}]: {}", direction, msg.len(), Hex(&msg[..used]));
+}
+
+/// Logs a high-rate stream at most once per [`FFB_LOG_INTERVAL`], with the number of
+/// packets since the previous logged one.
+struct Sampler {
+    last: Option<Instant>,
+    skipped: u32,
+}
+
+impl Sampler {
+    fn new() -> Self {
+        Self {
+            last: None,
+            skipped: 0,
+        }
+    }
+
+    fn log(&mut self, what: &str, packet: &[u8]) {
+        let now = Instant::now();
+        if self.last.is_some_and(|t| now - t < FFB_LOG_INTERVAL) {
+            self.skipped += 1;
+            return;
+        }
+        let used = packet.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        log::debug!(
+            "{} [{}] (+{} since last): {}",
+            what,
+            packet.len(),
+            self.skipped,
+            Hex(&packet[..used])
+        );
+        self.last = Some(now);
+        self.skipped = 0;
+    }
 }
 
 fn count(counter: &AtomicU32) {
