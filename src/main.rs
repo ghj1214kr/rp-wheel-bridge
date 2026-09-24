@@ -31,6 +31,18 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
 });
 
+/// Program name, version, description and URL, shown by `picotool info`.
+#[unsafe(link_section = ".bi_entries")]
+#[used]
+static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
+    embassy_rp::binary_info::rp_program_name!(c"rp-wheel-bridge"),
+    embassy_rp::binary_info::rp_cargo_version!(),
+    embassy_rp::binary_info::rp_program_description!(
+        c"Logitech G PRO Racing Wheel for Xbox/PC (c272) on PS5 as the PlayStation G PRO (c269)"
+    ),
+    embassy_rp::binary_info::rp_program_url!(c"https://github.com/ghj1214kr/rp-wheel-bridge"),
+];
+
 /// System clock. rp-pio-usb-host clocks its TX state machine at 48 MHz and its RX
 /// edge detector at 96 MHz; 192 MHz makes both dividers integers (4 / 2), so PIO steps
 /// do not jitter by a system clock, and leaves headroom for the receive loop. RP2350 is

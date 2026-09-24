@@ -45,6 +45,14 @@ PS5 ── native USB ──► RP2350 ◄── PIO USB host ── USB hub ─
   with more retries towards the auth controller.
 - Optional: a USB-UART adapter on GPIO0 (TX) / GPIO1 (RX), 921600 8N1, for logs.
 
+### Flash a release
+
+1. Download `rp-wheel-bridge-<version>.uf2` from
+   [Releases](https://github.com/ghj1214kr/rp-wheel-bridge/releases).
+2. Hold the board's BOOT button while connecting its native USB port to a computer.
+   A drive named `RP2350` appears.
+3. Copy the `.uf2` file onto the drive. The board restarts with the firmware.
+
 ### Build and flash
 
 Requirements: Rust (stable, the toolchain in `rust-toolchain.toml` installs the
@@ -55,6 +63,13 @@ Requirements: Rust (stable, the toolchain in `rust-toolchain.toml` installs the
 cargo build --release
 # board in BOOTSEL mode:
 cargo run --release      # picotool load --update --verify --execute
+```
+
+To make a UF2 file instead (the absolute block works around the RP2350-E10 erratum
+for drag-and-drop):
+
+```sh
+picotool uf2 convert target/thumbv8m.main-none-eabihf/release/rp-wheel-bridge -t elf rp-wheel-bridge.uf2 --family rp2350-arm-s --abs-block
 ```
 
 ### Usage
@@ -132,6 +147,14 @@ PS5 ── 네이티브 USB ──► RP2350 ◄── PIO USB 호스트 ── 
   인증용 컨트롤러와의 재시도가 더 잦았습니다.
 - 선택: 로그용 USB-UART 어댑터. GPIO0(TX) / GPIO1(RX), 921600 8N1.
 
+### 릴리스 펌웨어 올리기
+
+1. [Releases](https://github.com/ghj1214kr/rp-wheel-bridge/releases)에서
+   `rp-wheel-bridge-<버전>.uf2`를 받습니다.
+2. 보드의 BOOT 버튼을 누른 채로 네이티브 USB 포트를 컴퓨터에 연결합니다.
+   `RP2350`이라는 드라이브가 나타납니다.
+3. `.uf2` 파일을 그 드라이브에 복사합니다. 보드가 새 펌웨어로 다시 시작합니다.
+
 ### 빌드와 플래시
 
 필요한 것: Rust(stable. `rust-toolchain.toml`이 `thumbv8m.main-none-eabihf` 타깃을
@@ -141,6 +164,13 @@ PS5 ── 네이티브 USB ──► RP2350 ◄── PIO USB 호스트 ── 
 cargo build --release
 # 보드를 BOOTSEL 모드로 연결한 뒤:
 cargo run --release      # picotool load --update --verify --execute
+```
+
+UF2 파일로 만들려면 다음을 실행합니다. absolute block은 드래그 앤 드롭 때
+RP2350-E10 에라타를 피하기 위한 것입니다.
+
+```sh
+picotool uf2 convert target/thumbv8m.main-none-eabihf/release/rp-wheel-bridge -t elf rp-wheel-bridge.uf2 --family rp2350-arm-s --abs-block
 ```
 
 ### 사용법
