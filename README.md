@@ -103,6 +103,22 @@ the hub can be plugged and unplugged freely.
 and its hardware-timed SOF, the c272 → c269 input mapping, the PS5 protocol and
 authentication, and DriveHub captures.
 
+### Acknowledgments
+
+- [Embassy](https://embassy.dev): embassy-rp, embassy-usb and embassy-usb-host.
+- [rp-pio-usb-host](https://github.com/gnosek/rp-pio-usb-host) by Grzegorz Nosek, the
+  PIO USB host this bridge runs on (through a [fork](https://github.com/ghj1214kr/rp-pio-usb-host/tree/sof-during-transfers)),
+  itself built on [Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB).
+- [Logitech TrueForce Linux driver](https://github.com/mescon/logitech-trueforce-linux-driver)
+  by mescon: the G PRO's HID++, force feedback and TRUEFORCE protocol notes.
+- [wheel-adapter](https://github.com/jfedor2/wheel-adapter) by Jacek Fedorynski and
+  [GP2040-CE](https://github.com/OpenStickCommunity/GP2040-CE): PS4/PS5 authentication
+  through a licensed controller.
+- [usb-sniffer-lite](https://github.com/ataradov/usb-sniffer-lite) by Alex Taradov,
+  which found the force feedback dropout.
+- The [GTPlanet](https://www.gtplanet.net/forum/threads/logitech-g-pro-racing-wheel.412554/)
+  community, for the G PRO on PS5 reports.
+
 ### AI assistance
 
 This project was developed with AI assistance: most of the code and documentation
@@ -216,6 +232,22 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/rp-wheel-bridge -t
 [docs/](docs/README.md)에 하드웨어에서 알아낸 내용을 정리했습니다(영어). PIO USB
 호스트와 하드웨어 SOF, c272 → c269 입력 매핑, PS5 프로토콜과 인증, DriveHub 캡처
 분석이 들어 있습니다.
+
+### 감사의 말
+
+- [Embassy](https://embassy.dev): embassy-rp, embassy-usb, embassy-usb-host.
+- Grzegorz Nosek의 [rp-pio-usb-host](https://github.com/gnosek/rp-pio-usb-host): 이
+  브리지가 쓰는 PIO USB 호스트([포크](https://github.com/ghj1214kr/rp-pio-usb-host/tree/sof-during-transfers)).
+  [Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB)를 바탕으로 합니다.
+- mescon의 [Logitech TrueForce Linux driver](https://github.com/mescon/logitech-trueforce-linux-driver):
+  G PRO의 HID++, 포스 피드백, TRUEFORCE 프로토콜 문서.
+- Jacek Fedorynski의 [wheel-adapter](https://github.com/jfedor2/wheel-adapter)와
+  [GP2040-CE](https://github.com/OpenStickCommunity/GP2040-CE): 정품 컨트롤러를 통한
+  PS4/PS5 인증.
+- Alex Taradov의 [usb-sniffer-lite](https://github.com/ataradov/usb-sniffer-lite):
+  포스 피드백 끊김의 원인을 찾아 준 USB 스니퍼.
+- [GTPlanet](https://www.gtplanet.net/forum/threads/logitech-g-pro-racing-wheel.412554/)
+  커뮤니티의 PS5용 G PRO 관련 정보.
 
 ### AI 활용
 
