@@ -66,7 +66,9 @@ A GL850G hub (05e3:0610) lets the wheel and the auth pad share the one host port
   GL850G finishes that request only once the reset is done, ~25 ms), then GET_STATUS
   every 5 ms until the port is enabled, CLEAR_FEATURE(C_PORT_RESET), 10 ms recovery.
 - Up to 3 devices, full speed only (no split transactions or low-speed PRE).
-- A powered hub is used.
+- A powered hub is recommended. An unpowered one also ran for 30 minutes, with more
+  timeouts towards the auth pad (7 vs 2 in 10 minutes), all recovered by signing
+  again.
 
 ## The wheel (c272)
 
@@ -89,10 +91,31 @@ wheel base (the bridge talks to 0xff).
   bridge boots.
 - **LED feature:** the bridge asks for the index of feature 0x807a (getFeature) and
   drives the rev lights through it ([ps5.md](ps5.md)).
+- **Feature table:** at start-up the bridge reads the wheel's feature table
+  (IFeatureSet) and logs it at debug level. The indexes differ from the RS50 table in
+  the TrueForce driver's notes. Settings and other features of interest:
+
+  | index | feature | notes |
+  |---|---|---|
+  | 0x09 | 0x807a LED effects | rev lights |
+  | 0x12 | 0x8133 damping | |
+  | 0x13 | 0x8134 brake force | |
+  | 0x14 | 0x8136 FFB strength | |
+  | 0x15 | 0x8137 profile | notifies `05` on entering the onboard menu, `05 01` on leaving it |
+  | 0x16 | 0x8138 rotation | `03 84` = 900 degrees |
+  | 0x17 | 0x8139 TRUEFORCE | function 0 reads the level; notifies `12 ff 17 10 <hi> <lo>`, 0-0xffff = 0-100 % |
+  | 0x18 | 0x8140 FFB filter | |
+  | 0x1f | 0x812a | FFB state: `30` on, `20` off |
+
+  The full table (0x01-0x23): 0001, 0003, 0005, 00c2, 1e00, 0009, 1bc0, 8040, 807a,
+  807b, 80a4, 80d0, 8120, 8123, 8127, 8130, 8132, 8133, 8134, 8136, 8137, 8138, 8139,
+  8140, 1802, 1806, 1830, 18b1, 1eb0, 8129, 812a, 92c0, 92d2, 92e1, 1801.
 - The bridge's own HID++ requests use software ID 0xB; answers carrying it are not
   forwarded to the console.
 - Notifications seen: `12 ff 1f 00 30` when the console switches force feedback on,
-  `12 ff 1f 00 20` when it is off, `12 ff 16 00 03 84` = rotation 900 degrees.
+  `12 ff 1f 00 20` when it is off, `12 ff 16 00 03 84` = rotation 900 degrees, and
+  the onboard settings above whenever they are changed on the wheel. They are
+  forwarded; the PS5 does not use HID++.
 
 ## Known issues
 
@@ -102,12 +125,17 @@ wheel base (the bridge talks to 0xff).
   auth signs again. A fork change that stopped the SOF-preparation interrupt from
   retrying during transfers and re-checked the RX start flag did not reduce them and
   was dropped.
-- **Wheel dropping out of force feedback:** seen four times: three times right after
-  the OCTA refused a nonce page, once 0.5 s after the console's FFB set-up, before any
-  auth. The wheel notifies `12 ff 1f 00 20` + `12 ff 16 00 03 84`, STALLs FFB OUT,
-  and the console stops force feedback for good. Not seen in the last two 10-minute
-  drives. The bridge logs any pause over 100 ms in the FFB streams (console → bridge,
-  wheel → bridge) and any FFB packet taking over 20 ms to reach the wheel, to find
-  out whether the wheel has a watchdog on the force stream.
+- **Wheel dropping out of force feedback:** seen five times, each at the very moment
+  the OCTA answered a nonce page (SET F0) with STALL, on both a powered and an
+  unpowered hub; a SET F0 timeout never did it. The wheel NAKs and then STALLs
+  FFB OUT, notifies `12 ff 1f 00 20` + `12 ff 16 00 03 84` about 0.5 s later (the
+  notifications it sends at power-up, so its force feedback side seems to restart),
+  and usually stops answering control transfers for good while its input reports go
+  on. The console stops force feedback, and steering no longer works in the game.
+  The bridge then clears the FFB OUT halt and replays the console's FFB set-up, which
+  cannot help while the wheel's control endpoint is dead. Re-enumerating the wheel
+  through a port reset was not tried. The cause is not known; the bridge logs pauses
+  over 100 ms in the FFB streams and FFB packets taking over 20 ms to reach the
+  wheel.
 - Wheel range commands (`f8 81`) are not translated; the wheel keeps its own
   setting.

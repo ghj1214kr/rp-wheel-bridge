@@ -70,6 +70,20 @@ The console sends this only once. If the wheel drops out of force feedback later
 then STALLs FFB OUT), force feedback stays off; see
 [usb-host.md](usb-host.md#known-issues).
 
+## TRUEFORCE
+
+Per the [TRUEFORCE protocol notes](https://github.com/mescon/logitech-trueforce-linux-driver/blob/master/docs/TRUEFORCE_PROTOCOL.md),
+TRUEFORCE rides on the same force packets: byte 10 is the number of new samples,
+byte 11 a valid flag (0x0d) and the samples follow from byte 12. The G Pro has no USB
+audio interface.
+
+GT7 sends the TRUEFORCE start-up commands (05, 07, 06, 0e, 04, 03 above) but, in
+every drive so far, only 12-byte force packets with byte 10 = 0: no samples. That did
+not change with the wheel's onboard TRUEFORCE level at 100 %, 50 % or 0 % (the wheel
+reports changes as HID++ `12 ff 17 10 <hi> <lo>`, which the PS5 does not read). The
+bridge counts force packets carrying samples in its 5 s statistics (`TF n`), so a
+game that sends them would show up.
+
 ## Behaviour worth knowing
 
 - In the pits and in menus GT7 keeps sending force commands (with zero force), so

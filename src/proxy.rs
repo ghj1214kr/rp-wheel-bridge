@@ -100,12 +100,10 @@ const HIDPP_LONG_LEN: usize = 20;
 /// the bridge's and are not forwarded.
 const BRIDGE_SWID: u8 = 0x0b;
 
-/// IRoot (index 0) function 0 getFeature(0x807a, LED effects), software ID 0xB.
-const GET_FEATURE_LEDS: [u8; 7] = [0x10, 0xff, 0x00, 0x0b, 0x80, 0x7a, 0x00];
-
-/// Wheel feature index of 0x807a (0: unknown or absent), from [`GET_FEATURE_LEDS`].
+/// Wheel feature index of 0x807a (LED effects; 0: unknown or absent).
 static LED_FEATURE: AtomicU8 = AtomicU8::new(0);
-static LED_FEATURE_ANSWERED: AtomicBool = AtomicBool::new(false);
+/// The wheel's latest answer carrying [`BRIDGE_SWID`] (first 20 bytes).
+static BRIDGE_ANSWER: Signal<CriticalSectionRawMutex, [u8; 20]> = Signal::new();
 const FEATURE_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// PS5 IF0 output report 0x30, G29 command `f8 12 <mask>`: rev lights, one bit per
@@ -178,18 +176,21 @@ pub async fn run(
         forward_in(bus, info, &if1_in, "HID++", |p| {
             count(&WHEEL_HIDPP);
             let b = p.bytes();
-            // Byte 3 is function << 4 | software ID; notifications have ID 0.
-            let swid = b.get(3).map_or(0, |x| x & 0x0f);
+            // Byte 3 is function << 4 | software ID; notifications have ID 0. An error
+            // answer (`.. ff <index> <function|ID> <error>`) has it in byte 4.
+            let at = if b.get(2) == Some(&0xff) { 4 } else { 3 };
+            let swid = b.get(at).map_or(0, |x| x & 0x0f);
             let waking = WAKING.load(Ordering::Relaxed);
             if waking || swid == BRIDGE_SWID {
                 log_hidpp("wheel -> bridge", b);
                 if waking && swid != 0 {
                     WHEEL_ANSWERED.store(true, Ordering::Relaxed);
                 }
-                // getFeature answer: IRoot (index 0), function 0, feature index in byte 4.
-                if swid == BRIDGE_SWID && b.get(2) == Some(&0) && b[3] >> 4 == 0 {
-                    LED_FEATURE.store(b.get(4).copied().unwrap_or(0), Ordering::Relaxed);
-                    LED_FEATURE_ANSWERED.store(true, Ordering::Relaxed);
+                if swid == BRIDGE_SWID {
+                    let mut answer = [0u8; 20];
+                    let n = b.len().min(answer.len());
+                    answer[..n].copy_from_slice(&b[..n]);
+                    BRIDGE_ANSWER.signal(answer);
                 }
                 return Ok(());
             }
@@ -306,6 +307,7 @@ async fn serve_ep0(ep0: &mut ControlPipe) {
     }
 
     if PROFILE.role != Role::Mirror {
+        log_feature_table(ep0).await;
         query_led_feature(ep0).await;
     }
 
@@ -350,34 +352,87 @@ async fn serve_ep0(ep0: &mut ControlPipe) {
     }
 }
 
+/// Send a HID++ short request (software ID [`BRIDGE_SWID`]) and wait for the answer.
+/// `None` on a transfer error, a timeout or an HID++ error answer.
+async fn hidpp_request(ep0: &mut ControlPipe, msg: &[u8; 7]) -> Option<[u8; 20]> {
+    BRIDGE_ANSWER.reset();
+    log_hidpp("bridge -> wheel", msg);
+    if let Err(e) = ep0.control_out(&hidpp_short_setup(), msg).await {
+        log::warn!("proxy: HID++ request failed: {:?}", e);
+        return None;
+    }
+    let answer = with_timeout(FEATURE_QUERY_TIMEOUT, BRIDGE_ANSWER.wait())
+        .await
+        .ok()?;
+    (answer[2] != 0xff).then_some(answer)
+}
+
+/// IRoot (index 0) function 0 getFeature: the wheel's index of `feature` (0: absent).
+async fn get_feature(ep0: &mut ControlPipe, feature: u16) -> Option<u8> {
+    let [hi, lo] = feature.to_be_bytes();
+    let msg = [0x10, 0xff, 0x00, BRIDGE_SWID, hi, lo, 0x00];
+    hidpp_request(ep0, &msg).await.map(|a| a[4])
+}
+
 /// Ask the wheel for the index of its LED effects feature (0x807a).
 async fn query_led_feature(ep0: &mut ControlPipe) {
-    LED_FEATURE_ANSWERED.store(false, Ordering::Relaxed);
-    log_hidpp("bridge -> wheel", &GET_FEATURE_LEDS);
-    if let Err(e) = ep0
-        .control_out(&hidpp_short_setup(), &GET_FEATURE_LEDS)
-        .await
-    {
-        log::warn!("proxy: getFeature(0x807a) failed: {:?}", e);
-        return;
-    }
-    let start = Instant::now();
-    while !LED_FEATURE_ANSWERED.load(Ordering::Relaxed) {
-        if start.elapsed() >= FEATURE_QUERY_TIMEOUT {
-            log::warn!("proxy: no answer to getFeature(0x807a); rev lights off");
-            return;
+    match get_feature(ep0, 0x807a).await {
+        None => log::warn!("proxy: no answer to getFeature(0x807a); rev lights off"),
+        Some(0) => log::warn!("proxy: wheel has no LED effects feature (0x807a)"),
+        Some(index) => {
+            LED_FEATURE.store(index, Ordering::Relaxed);
+            log::info!(
+                "proxy: LED effects (0x807a) at feature index {:#04x}",
+                index
+            );
         }
-        Timer::after_millis(5).await;
     }
-    let index = LED_FEATURE.load(Ordering::Relaxed);
-    if index == 0 {
-        log::warn!("proxy: wheel has no LED effects feature (0x807a)");
+}
+
+/// HID++ feature IFeatureSet: function 0 getCount, function 1 getFeatureID(index).
+const FEATURE_SET: u16 = 0x0001;
+/// HID++ feature TRUEFORCE (index 0x17 on the c272; level 0-0xffff).
+const TRUEFORCE: u16 = 0x8139;
+
+/// Log the wheel's feature table (index → feature ID, debug level) and its TRUEFORCE
+/// state. The wheel notifies onboard setting changes as `12 ff <index> ..`; the table
+/// names the index. On the c272 function 0 of TRUEFORCE returns the onboard level
+/// (`ff ff` = 100%); function 1 returned `00 00`.
+async fn log_feature_table(ep0: &mut ControlPipe) {
+    let Some(set @ 1..) = get_feature(ep0, FEATURE_SET).await else {
+        log::warn!("proxy: wheel has no IFeatureSet");
         return;
+    };
+    let Some(count) = hidpp_request(ep0, &[0x10, 0xff, set, BRIDGE_SWID, 0, 0, 0]).await
+    else {
+        return;
+    };
+    for index in 1..=count[4] {
+        let msg = [0x10, 0xff, set, 0x10 | BRIDGE_SWID, index, 0, 0];
+        if let Some(a) = hidpp_request(ep0, &msg).await {
+            log::debug!(
+                "proxy: HID++ feature {:#04x} = {:04x} (type {:02x})",
+                index,
+                u16::from_be_bytes([a[4], a[5]]),
+                a[6]
+            );
+        }
     }
-    log::info!(
-        "proxy: LED effects (0x807a) at feature index {:#04x}",
-        index
-    );
+    let Some(tf @ 1..) = get_feature(ep0, TRUEFORCE).await else {
+        log::info!("proxy: wheel has no TRUEFORCE feature");
+        return;
+    };
+    for function in 0..2u8 {
+        let msg = [0x10, 0xff, tf, function << 4 | BRIDGE_SWID, 0, 0, 0];
+        if let Some(a) = hidpp_request(ep0, &msg).await {
+            log::info!(
+                "proxy: TRUEFORCE ({:#04x}) function {}: {}",
+                tf,
+                function,
+                Hex(&a[4..16])
+            );
+        }
+    }
 }
 
 /// PS5 rev lights (IF0 output `30 f8 12 <mask>`, 5 LEDs as bits) → the wheel's 10 rev
@@ -481,6 +536,9 @@ async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDes
         let packet = FFB_OUT.receive().await;
         let data = packet.bytes();
         sampler.log("FFB upstream -> wheel", data);
+        if carries_trueforce(data) {
+            count(&FFB_TRUEFORCE);
+        }
         if let [0x01, _, _, _, cmd, seq, ..] = *data {
             if cmd == FFB_CMD_SETTING && seq == 0x01 {
                 setup_len = 0;
@@ -518,6 +576,17 @@ async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDes
             }
         }
     }
+}
+
+/// Force stream packets from the console carrying TRUEFORCE samples, per stats interval.
+static FFB_TRUEFORCE: AtomicU32 = AtomicU32::new(0);
+/// Byte 10 of a force packet: the number of new TRUEFORCE samples (mescon's
+/// TRUEFORCE_PROTOCOL.md). GT7 was seen sending 12-byte packets with none.
+const FFB_TF_SAMPLES: usize = 10;
+
+fn carries_trueforce(data: &[u8]) -> bool {
+    data.get(FFB_CMD) == Some(&FFB_CMD_FORCE)
+        && (data.len() > 12 || data.get(FFB_TF_SAMPLES).is_some_and(|&n| n != 0))
 }
 
 /// The wheel STALLed force feedback: clear the halt and replay the console's set-up.
@@ -710,7 +779,7 @@ async fn log_stats() {
         ticker.next().await;
         let take = |c: &AtomicU32| c.swap(0, Ordering::Relaxed);
         log::info!(
-            "proxy {}s: input {} -> {} | HID++ in {} -> {}, out {} -> {} | FFB in {} -> {}, out {} -> {} | dropped {}",
+            "proxy {}s: input {} -> {} | HID++ in {} -> {}, out {} -> {} | FFB in {} -> {}, out {} -> {} (TF {}) | dropped {}",
             STATS_INTERVAL.as_secs(),
             take(&WHEEL_INPUT),
             take(&STATS.input_sent),
@@ -722,6 +791,7 @@ async fn log_stats() {
             take(&STATS.ffb_sent),
             take(&STATS.ffb_received),
             take(&FFB_WRITTEN),
+            take(&FFB_TRUEFORCE),
             take(&STATS.dropped),
         );
     }

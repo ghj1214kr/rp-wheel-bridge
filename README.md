@@ -40,8 +40,9 @@ PS5 ── native USB ──► RP2350 ◄── PIO USB host ── USB hub ─
 - Logitech G PRO Racing Wheel for Xbox/PC (c272).
 - A licensed PS4-mode controller for authentication; tested with the HORI Fighting
   Commander OCTA in PS4 mode.
-- A powered USB 2.0 hub (tested with a Genesys Logic GL850G) to connect both to the
-  board's USB-A port.
+- A USB 2.0 hub (tested with a Genesys Logic GL850G) to connect both to the board's
+  USB-A port. A powered hub is recommended; an unpowered one also ran for 30 minutes,
+  with more retries towards the auth controller.
 - Optional: a USB-UART adapter on GPIO0 (TX) / GPIO1 (RX), 921600 8N1, for logs.
 
 ### Build and flash
@@ -74,7 +75,9 @@ the hub can be plugged and unplugged freely.
 - Occasional USB errors on the PIO bus are recovered automatically. The wheel has
   been seen to drop out of force feedback a few times; see
   [docs/usb-host.md](docs/usb-host.md#known-issues).
-- TRUEFORCE is not supported.
+- TRUEFORCE: the force stream is forwarded as it is, but GT7 was not seen sending
+  any TRUEFORCE samples to the bridge, whatever the wheel's onboard TRUEFORCE level
+  ([docs/ps5.md](docs/ps5.md#trueforce)).
 
 ### Documentation
 
@@ -127,8 +130,9 @@ PS5 ── 네이티브 USB ──► RP2350 ◄── PIO USB 호스트 ── 
 - Logitech G PRO Racing Wheel Xbox/PC용 (c272)
 - 인증용 정품 PS4 모드 컨트롤러. HORI Fighting Commander OCTA(PS4 모드)로
   테스트했습니다.
-- 두 장치를 보드의 USB-A 포트에 연결할 전원 공급형 USB 2.0 허브. Genesys Logic
-  GL850G로 테스트했습니다.
+- 두 장치를 보드의 USB-A 포트에 연결할 USB 2.0 허브. Genesys Logic GL850G로
+  테스트했습니다. 전원 공급형 허브를 권장합니다. 무전원 허브로도 30분 동안 동작했지만
+  인증용 컨트롤러와의 재시도가 더 잦았습니다.
 - 선택: 로그용 USB-UART 어댑터. GPIO0(TX) / GPIO1(RX), 921600 8N1.
 
 ### 빌드와 플래시
@@ -159,7 +163,9 @@ cargo run --release      # picotool load --update --verify --execute
 - PIO 버스의 간헐적인 USB 오류는 자동으로 복구됩니다. 휠이 포스 피드백에서 빠지는
   현상이 몇 번 있었습니다. [docs/usb-host.md](docs/usb-host.md#known-issues)를
   참고하세요.
-- TRUEFORCE는 지원하지 않습니다.
+- TRUEFORCE: 포스 피드백 스트림은 그대로 전달하지만, GT7은 휠의 내장 TRUEFORCE
+  설정과 관계없이 TRUEFORCE 샘플을 보내지 않았습니다
+  ([docs/ps5.md](docs/ps5.md#trueforce)).
 
 ### 문서
 
