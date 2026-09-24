@@ -1,6 +1,6 @@
 [package]
 name = "rp-wheel-bridge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Logitech G PRO Racing Wheel for Xbox/PC on a PS5, through an RP2350 (pure Rust, Embassy)"
 license = "MIT OR Apache-2.0"
