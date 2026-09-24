@@ -1,7 +1,7 @@
 //! IF0 input translation: G Pro Xbox/PC (c272) 30-byte report → the 64-byte DS4-style
 //! report 0x01 of the PlayStation-mode G Pro as DriveHub presents it (c269).
 //!
-//! Mapping captured control by control through DriveHub (PS5_G_Pro_INFO.md §0.3).
+//! Mapping captured control by control through DriveHub (docs/input-mapping.md).
 
 /// Length of the c272 IF0 input report (no report ID).
 pub const C272_LEN: usize = 30;

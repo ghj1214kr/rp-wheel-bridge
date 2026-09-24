@@ -1,1 +1,4 @@
 /target
+
+# Raw hardware logs: may contain device serial numbers.
+/captures

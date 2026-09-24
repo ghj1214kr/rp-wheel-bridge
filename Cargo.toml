@@ -2,6 +2,9 @@
 name = "rp-wheel-bridge"
 version = "0.1.0"
 edition = "2024"
+description = "Logitech G PRO Racing Wheel for Xbox/PC on a PS5, through an RP2350 (pure Rust, Embassy)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ghj1214kr/rp-wheel-bridge"
 
 [dependencies]
 embassy-executor = {

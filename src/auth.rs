@@ -1,6 +1,7 @@
 //! PS4/PS5 peripheral authentication relay: IF0 feature reports F0-F3, answered to the
-//! console from a cache that the host side fills from a device that can sign (now
-//! DriveHub; later the licensed auth pad).
+//! console from a cache that the host side fills from a device that can sign: a
+//! licensed PS4-mode controller behind the bridge, or DriveHub in the relay role.
+//! Protocol and signer quirks: docs/ps5-auth.md.
 //!
 //! Report layout (GP2040-CE / jfedor2 wheel-adapter, also used by the earlier
 //! ps5-wheel-passthrough project):

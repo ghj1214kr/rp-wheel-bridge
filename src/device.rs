@@ -1,7 +1,7 @@
 //! Native USB device, in one of three roles ([`PROFILE`]):
 //!
 //! - [`PS5`] ([`Role::Wheel`]): the PlayStation-mode G Pro (046d:c269), reproduced from
-//!   what DriveHub presents (PS5_G_Pro_INFO.md §0.2-0.4): same descriptors, endpoint
+//!   what DriveHub presents (docs/drivehub.md): same descriptors, endpoint
 //!   numbers and packet sizes, same feature reports; the c272 wheel behind it, its IF0
 //!   input translated by [`crate::proxy`].
 //! - [`RELAY_C269`] ([`Role::Relay`]): the same identity, with DriveHub (itself a c269)
