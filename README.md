@@ -96,7 +96,7 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 
 ## 한국어
 
-**Logitech G PRO Racing Wheel(Xbox/PC용, 046d:c272)**을 **PlayStation 5**에서
+**Logitech G PRO Racing Wheel**(Xbox/PC용, 046d:c272)을 **PlayStation 5**에서
 PlayStation용 G PRO(046d:c269)로 쓸 수 있게 해 주는 RP2350 보드용 펌웨어입니다.
 [Embassy](https://embassy.dev) 기반의 순수 Rust로 작성했고, USB 호스트는 RP2350의
 PIO로 구현했습니다.
