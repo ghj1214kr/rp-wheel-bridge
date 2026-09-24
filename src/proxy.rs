@@ -55,6 +55,8 @@ const HID_SET_IDLE: u8 = 0x0a;
 const FFB_LOG_INTERVAL: Duration = Duration::from_millis(100);
 
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
+/// Pause after a failed IN transfer before polling again.
+const IN_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -178,11 +180,24 @@ async fn forward_input(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDescr
             }
             Ok(n) => log::warn!("proxy: IF0 report of {} bytes ignored", n),
             Err(e) => {
-                log::warn!("proxy: IF0 IN failed: {:?}; input stopped", e);
-                return;
+                if !keep_polling("proxy: IF0", e).await {
+                    return;
+                }
             }
         }
     }
+}
+
+/// After a failed IN transfer: stop on a detach; otherwise (a STALL or garbled reply,
+/// seen now and then) log it and go on polling shortly.
+async fn keep_polling(name: &str, e: PipeError) -> bool {
+    if matches!(e, PipeError::Disconnected | PipeError::Canceled) {
+        log::warn!("{} IN failed: {:?}; stopped", name, e);
+        return false;
+    }
+    log::warn!("{} IN failed: {:?}; polling on", name, e);
+    Timer::after(IN_ERROR_BACKOFF).await;
+    true
 }
 
 /// Backend IN endpoint → queue to the native-port device.
@@ -205,8 +220,9 @@ pub(crate) async fn forward_in<E>(
                 }
             }
             Err(e) => {
-                log::warn!("{} IN failed: {:?}; stopped", name, e);
-                return;
+                if !keep_polling(name, e).await {
+                    return;
+                }
             }
         }
     }

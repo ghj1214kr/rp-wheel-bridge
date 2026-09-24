@@ -42,7 +42,9 @@ const SIGNATURE_LEN: usize = 64;
 const STATE_LEN: usize = 16;
 const RESET_LEN: usize = 8;
 
+const NONCE_LEN: usize = 64;
 const LAST_NONCE_PAGE: u8 = 4;
+const NONCE_PAGES: usize = LAST_NONCE_PAGE as usize + 1;
 const SIGNATURE_PAGES: usize = 19;
 
 /// F2 byte 2.
@@ -52,6 +54,11 @@ const STATE_READY: u8 = 0x00;
 /// How often the signer's F2 is polled, and for how long.
 const SIGNER_POLL: Duration = Duration::from_millis(20);
 const SIGNER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Signing runs per console nonce. The HORI OCTA steps its F1 page on every GET it
+/// takes, also one whose reply is lost (500 ms timeout) or a SETUP resent after a
+/// garbled ACK (a page skipped), so a lost page can only be had again by signing the
+/// same nonce once more. Errors come in bursts of a second or two.
+const SIGN_ATTEMPTS: u32 = 10;
 
 /// F3 as DriveHub (both captures) answers it; given to the console until a signer's
 /// own F3 has been read.
@@ -197,6 +204,10 @@ pub async fn serve(ep0: &mut ControlPipe, iface: u16) -> ! {
     }
 }
 
+/// The console's nonce pages, kept by the signer side to sign again.
+static NONCE: Mutex<CS, RefCell<[[u8; NONCE_LEN]; NONCE_PAGES]>> =
+    Mutex::new(RefCell::new([[0; NONCE_LEN]; NONCE_PAGES]));
+
 /// Act on one console event, with the signer's auth reports on HID interface `iface`.
 pub async fn handle(cmd: Cmd, ep0: &mut ControlPipe, iface: u16) {
     match cmd {
@@ -208,26 +219,70 @@ pub async fn handle(cmd: Cmd, ep0: &mut ControlPipe, iface: u16) {
         }
         Cmd::Nonce(page) => {
             let data = page.bytes();
-            let setup = SetupPacket::class_interface_out(
-                HID_SET_REPORT,
-                REPORT_TYPE_FEATURE << 8 | u16::from(ID_NONCE),
-                iface,
-                data.len() as u16,
-            );
-            if let Err(e) = ep0.control_out(&setup.to_bytes(), data).await {
-                log::warn!("auth: signer SET F0 failed: {:?}", e);
+            if let Some(&n) = data.get(2)
+                && usize::from(n) < NONCE_PAGES
+                && data.len() == NONCE_LEN
+            {
+                NONCE.lock(|p| p.borrow_mut()[usize::from(n)].copy_from_slice(data));
+            }
+            if !set_nonce(ep0, iface, data).await {
                 return;
             }
-            log::debug!("auth: signer SET F0 [{}]: {}", data.len(), Hex(data));
             if data.get(2) == Some(&LAST_NONCE_PAGE) {
-                fetch_signature(ep0, iface).await;
+                sign(ep0, iface).await;
             }
         }
     }
 }
 
+/// SET_REPORT(Feature) F0 to the signer.
+async fn set_nonce(ep0: &mut ControlPipe, iface: u16, data: &[u8]) -> bool {
+    let setup = SetupPacket::class_interface_out(
+        HID_SET_REPORT,
+        REPORT_TYPE_FEATURE << 8 | u16::from(ID_NONCE),
+        iface,
+        data.len() as u16,
+    );
+    if let Err(e) = ep0.control_out(&setup.to_bytes(), data).await {
+        log::warn!("auth: signer SET F0 failed: {:?}", e);
+        return false;
+    }
+    log::debug!("auth: signer SET F0 [{}]: {}", data.len(), Hex(data));
+    true
+}
+
+/// Get the whole signature for the nonce just sent, signing it again (all nonce pages
+/// resent) whenever a page is lost.
+async fn sign(ep0: &mut ControlPipe, iface: u16) {
+    for attempt in 1..=SIGN_ATTEMPTS {
+        if attempt > 1 {
+            log::info!("auth: signing the nonce again (attempt {})", attempt);
+            let pages = NONCE.lock(|p| *p.borrow());
+            for page in &pages {
+                if !set_nonce(ep0, iface, page).await {
+                    return;
+                }
+            }
+        }
+        match fetch_signature(ep0, iface).await {
+            Fetch::Done => return,
+            Fetch::PageLost => {}
+            Fetch::NotReady => return,
+        }
+    }
+    log::warn!("auth: no complete signature after {} attempts", SIGN_ATTEMPTS);
+}
+
+enum Fetch {
+    Done,
+    /// A signature page was not received (or one was skipped); sign again.
+    PageLost,
+    /// The signer never became ready.
+    NotReady,
+}
+
 /// Poll the signer's F2 until it is ready, then fetch every F1 page and publish them.
-async fn fetch_signature(ep0: &mut ControlPipe, iface: u16) {
+async fn fetch_signature(ep0: &mut ControlPipe, iface: u16) -> Fetch {
     let start = Instant::now();
     let mut state = [0u8; STATE_LEN];
     let mut last = [0xffu8; 3];
@@ -237,7 +292,7 @@ async fn fetch_signature(ep0: &mut ControlPipe, iface: u16) {
                 "auth: signer not ready after {} s",
                 SIGNER_TIMEOUT.as_secs()
             );
-            return;
+            return Fetch::NotReady;
         }
         if get_feature(ep0, iface, ID_STATE, &mut state)
             .await
@@ -261,13 +316,32 @@ async fn fetch_signature(ep0: &mut ControlPipe, iface: u16) {
     let mut pages = [[0u8; SIGNATURE_LEN]; SIGNATURE_PAGES];
     for (i, page) in pages.iter_mut().enumerate() {
         if get_feature(ep0, iface, ID_SIGNATURE, page).await.is_none() {
-            log::warn!("auth: signer F1 page {} unreadable", i);
-            return;
+            log::warn!("auth: signer F1 page {} lost", i);
+            return Fetch::PageLost;
+        }
+        // Byte 2 is the page number; the signer steps it on every GET.
+        if usize::from(page[2]) != i {
+            log::warn!("auth: signer F1 page {} came as page {}", i, page[2]);
+            return Fetch::PageLost;
         }
         log::debug!("auth: signer F1 [{}]: {}", i, Hex(page));
     }
     STATE.lock(|s| {
         let mut s = s.borrow_mut();
+        // Answer with the console's nonce id: DriveHub echoes it, the OCTA uses its own
+        // counter. F1/F2 carry no checksum (their last 4 bytes are zero).
+        let nonce_id = s.nonce_id;
+        if state[1] != nonce_id {
+            log::info!(
+                "auth: signer nonce id {} rewritten to the console's {}",
+                state[1],
+                nonce_id
+            );
+        }
+        state[1] = nonce_id;
+        for page in pages.iter_mut() {
+            page[1] = nonce_id;
+        }
         s.signature = pages;
         s.ready_state = state;
         s.next_page = 0;
@@ -278,6 +352,7 @@ async fn fetch_signature(ep0: &mut ControlPipe, iface: u16) {
         SIGNATURE_PAGES,
         start.elapsed().as_millis()
     );
+    Fetch::Done
 }
 
 /// GET_REPORT(Feature, `id`) on HID interface `iface` into `buf`; `None` on failure

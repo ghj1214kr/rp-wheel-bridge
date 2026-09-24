@@ -408,6 +408,30 @@ Consequences for the bridge's own PS5 mode (c272 behind it):
   (`00 01 00 0a 00 NN`, NN 04/06/08/0a seen) still needs a correlated capture.
 - `f3/f4/f5/13/f8 04 01` are G29 autocenter/force-slot commands. The native FFB stream
   makes them irrelevant, probably.
+
+### 0.7 PS5 ⇄ bridge with the licensed pad as signer (2026-09-24)
+
+Setup: GL850G hub on the bridge's USB-A port, c272 wheel + HORI Fighting Commander
+OCTA (0f0d:0162, PS4 mode) behind it. The bridge presents c269 and relays auth to the
+OCTA's HID interface 3 (same F0-F3 reports).
+
+- 10 min of GT7 driving without a disconnect. G Pro recognized, steering and FFB OK.
+- **The PS5 authenticates again and again**: a new round (GET F3, nonce id + 1)
+  starts ~30 s after the previous round's last F1 page, i.e. every ~57 s.
+- A round that never finishes (F2 stays "signing") is tolerated: the console started
+  the next round ~70 s later without dropping the device.
+- OCTA quirks:
+  - F2/F1 carry the OCTA's own counter (04, 08, 0f, 13 ...) instead of the console's
+    nonce id; the bridge rewrites byte 1 to the console's id (F1/F2 have no checksum,
+    their last 4 bytes are zero).
+  - Signing takes ~270 ms after the last nonce page.
+  - It steps its F1 page on every GET it takes, even one whose reply the host never
+    receives (timeout) or a resent SETUP. A lost page cannot be asked for again; the
+    bridge checks the page number (byte 2) and signs the same nonce again.
+  - F1 pages match the PS4 DS4 layout: page 13 ends with `01 00 01` (RSA exponent
+    65537), data up to page 18.
+- The wheel powers on by itself when the bridge boots (fresh USB host + immediate
+  HID++ ping); nothing from the PS5 is needed for that.
 - For auth, put the licensed pad behind the bridge as the signer (a hub or a second
   host port).
 
