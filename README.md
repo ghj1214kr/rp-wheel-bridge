@@ -97,6 +97,14 @@ the hub can be plugged and unplugged freely.
 and its hardware-timed SOF, the c272 → c269 input mapping, the PS5 protocol and
 authentication, and DriveHub captures.
 
+### AI assistance
+
+This project was developed with AI assistance: most of the code and documentation
+was written with [Claude Code](https://www.anthropic.com/claude-code) (Anthropic),
+under the author's direction. Every behaviour described here was tested by the author
+on the real hardware (the wheel, a PS5 and Gran Turismo 7), and the protocol findings
+come from the author's USB logs and captures.
+
 ### Disclaimer
 
 Not affiliated with Logitech, Sony or Collective Minds. Authentication requires a
@@ -196,6 +204,13 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/rp-wheel-bridge -t
 [docs/](docs/README.md)에 하드웨어에서 알아낸 내용을 정리했습니다(영어). PIO USB
 호스트와 하드웨어 SOF, c272 → c269 입력 매핑, PS5 프로토콜과 인증, DriveHub 캡처
 분석이 들어 있습니다.
+
+### AI 활용
+
+이 프로젝트는 AI의 도움을 받아 개발했습니다. 코드와 문서의 대부분은 작성자의 지시에
+따라 [Claude Code](https://www.anthropic.com/claude-code)(Anthropic)로 작성했습니다.
+여기 적힌 모든 동작은 작성자가 실제 하드웨어(휠, PS5, 그란 투리스모 7)에서
+테스트했고, 프로토콜 분석은 작성자의 USB 로그와 캡처를 바탕으로 했습니다.
 
 ### 면책
 
