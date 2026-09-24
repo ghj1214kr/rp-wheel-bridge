@@ -1308,6 +1308,7 @@ dependencies = [
  "embedded-io-async 0.7.0",
  "log",
  "panic-probe",
+ "rp-pac",
  "rp-pio-usb-host",
  "static_cell",
 ]

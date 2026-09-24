@@ -39,6 +39,9 @@ embassy-usb = {
 
 # Log output on UART0 (src/uart_log.rs).
 embassy-sync = "0.8.0"
+# The USB controller's pull-up, switched by the device (embassy-rp's `Bus::disable` is
+# a no-op); the same rp-pac as embassy-rp's.
+rp-pac = { version = "7.0.0", default-features = false, features = ["rp235x"] }
 embedded-io-async = "0.7.0"
 critical-section = "1.2.0"
 

@@ -318,6 +318,25 @@ pub static IF0_OUT: Channel<CS, Packet, QUEUE_LEN> = Channel::new();
 /// mirror if [`MIRROR_WAIT_FOR_WHEEL`].
 pub static BACKEND_READY: Signal<CS, ()> = Signal::new();
 
+/// Wheel role: whether the wheel is attached and awake. The device is on the bus only
+/// then. When the wheel goes away (unplugged, switched off) the console
+/// sees the controller unplugged; when it is back, a new controller, which the console
+/// sets up from scratch (the user picks it with the PS button). Replaying the console's
+/// set-up to a wheel that came back was tried: the wheel switched force feedback off
+/// again at once, and a direct drive wheel is better started by the game anyway.
+///
+/// A queue, not a `Signal`: a quick off-and-on (FFB recovery) must not collapse into
+/// "on".
+static WHEEL_LINK: Channel<CS, bool, 4> = Channel::new();
+
+/// Report the wheel attached and awake (`true`) or gone (`false`).
+pub fn wheel_link(attached: bool) {
+    let _ = WHEEL_LINK.try_send(attached);
+}
+
+/// Off the bus at least this long, so the console surely sees the unplug.
+const MIN_DETACH: embassy_time::Duration = embassy_time::Duration::from_millis(500);
+
 static INPUT: Mutex<CS, Cell<[u8; input_map::C269_LEN]>> =
     Mutex::new(Cell::new(input_map::neutral()));
 
@@ -362,10 +381,14 @@ pub async fn task(driver: Driver<'static, USB>) -> ! {
         Role::Relay => true,
         Role::Mirror => MIRROR_WAIT_FOR_WHEEL,
     };
+    // The D+ pull-up is enabled by `Builder::build`: stay off the bus until then.
     if wait {
-        // The D+ pull-up is enabled by `Builder::build`: stay off the bus until then.
         log::info!("{}: waiting for the device behind the bridge", p.name);
         BACKEND_READY.wait().await;
+    }
+    if p.role == Role::Wheel {
+        log::info!("{}: waiting for the wheel", p.name);
+        while !WHEEL_LINK.receive().await {}
     }
 
     let mut config = Config::new(p.vid, p.pid);
@@ -427,7 +450,7 @@ pub async fn task(driver: Driver<'static, USB>) -> ! {
     log::info!("{}: {:04x}:{:04x} on native USB", p.name, p.vid, p.pid);
 
     join5(
-        usb.run(),
+        join(usb.run(), follow_wheel()),
         send_input(&mut if0_in),
         if0_output(if0_out.as_mut()),
         forward_in(&mut if1_in, &HIDPP_IN, &STATS.hidpp_sent),
@@ -438,6 +461,43 @@ pub async fn task(driver: Driver<'static, USB>) -> ! {
     )
     .await;
     unreachable!("USB device futures never return")
+}
+
+/// Wheel role: go off the bus while the wheel is away (see [`WHEEL_LINK`]). The
+/// controller's pull-up is switched directly: embassy-rp's `Bus::disable` does nothing,
+/// so `UsbDevice::disable` would leave the device on the bus.
+async fn follow_wheel() -> ! {
+    if PROFILE.role != Role::Wheel {
+        core::future::pending::<()>().await;
+    }
+    let mut attached = true;
+    loop {
+        let link = WHEEL_LINK.receive().await;
+        if link == attached {
+            continue;
+        }
+        attached = link;
+        if !attached {
+            log::info!("{}: wheel gone; off the bus", PROFILE.name);
+            set_pullup(false);
+            embassy_time::Timer::after(MIN_DETACH).await;
+        } else {
+            // Nothing queued for the old connection goes to the new one.
+            INPUT_IN.clear();
+            HIDPP_IN.clear();
+            FFB_IN.clear();
+            FFB_OUT.clear();
+            CONTROL_OUT.clear();
+            IF0_OUT.clear();
+            log::info!("{}: wheel ready; on the bus again", PROFILE.name);
+            set_pullup(true);
+        }
+    }
+}
+
+/// The USB controller's D+ pull-up (SIE_CTRL.PULLUP_EN): on, the console sees a device.
+fn set_pullup(on: bool) {
+    rp_pac::USB.sie_ctrl().modify(|w| w.set_pullup_en(on));
 }
 
 fn ep(number: u8, dir: Direction) -> EndpointAddress {

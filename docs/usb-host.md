@@ -164,6 +164,22 @@ wheel base (the bridge talks to 0xff).
   the onboard settings above whenever they are changed on the wheel. They are
   forwarded; the PS5 does not use HID++.
 
+## Wheel going away
+
+When the wheel is switched off or unplugged behind the hub, the bridge takes the
+device off the PS5's bus (the USB controller's D+ pull-up off, for at least 0.5 s), and
+puts it back once the wheel is attached and awake again. The PS5 sees a controller
+unplugged and a new one plugged in: after the PS button, the game sets force feedback
+up from scratch. At boot the device likewise waits for the wheel.
+
+Replaying the console's set-up to the returning wheel was tried first: the replay went
+through, but the wheel switched force feedback off again within half a second
+(`12 ff 1f 00 21`, then `20`), and the console stopped streaming. A clean start by the
+game is also safer with a direct drive wheel than forces resuming mid-race.
+
+embassy-rp's `Bus::disable` is a no-op, so `UsbDevice::disable` leaves the pull-up on;
+the bridge switches `SIE_CTRL.PULLUP_EN` itself (through `rp-pac`).
+
 ## Known issues
 
 - **Missed handshakes:** ~5 per second while force feedback streams, the host gets
@@ -176,7 +192,8 @@ wheel base (the bridge talks to 0xff).
   handshakes](#lost-handshakes).
 - **Force feedback recovery is untested:** should the wheel still drop out of force
   feedback (it STALLs FFB OUT; the one cause seen so far is fixed, see [lost
-  handshakes](#lost-handshakes)), the bridge clears the halt and replays the console's
-  FFB set-up, but whether the console then carries on was never seen. The bridge logs
-  pauses over 100 ms in the FFB streams and FFB packets taking over 20 ms to reach the
-  wheel.
+  handshakes](#lost-handshakes)), the bridge leaves the PS5's bus, clears the halt and
+  comes back, as when the wheel is switched off and on ([below](#wheel-going-away)).
+  That path was tested by switching the wheel off, not with a real STALL. The bridge
+  logs pauses over 100 ms in the FFB streams and FFB packets taking over 20 ms to reach
+  the wheel.

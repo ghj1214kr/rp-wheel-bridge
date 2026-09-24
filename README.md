@@ -77,7 +77,12 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/rp-wheel-bridge -t
 1. Connect the wheel and the licensed controller to the hub, and the hub to the
    board's USB-A port.
 2. Connect the board's native USB port to the PS5.
-3. The wheel turns on and calibrates; the PS5 sees a G PRO.
+3. The wheel turns on and calibrates; the PS5 sees a G PRO once the wheel is ready.
+   Press the PS button to use it.
+
+If the wheel is switched off or unplugged, the bridge leaves the PS5 as a real
+controller would (the PS5 reports it disconnected). When the wheel is back, the PS5
+sees it anew: press the PS button, and the game sets up force feedback again.
 
 The board's USB-A port has a pull-up (R13) fitted for device use, so the root port
 never sees a detach: plug the hub in first, then (re)power the board. Devices behind
@@ -207,7 +212,12 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/rp-wheel-bridge -t
 
 1. 휠과 정품 컨트롤러를 허브에 연결하고, 허브를 보드의 USB-A 포트에 연결합니다.
 2. 보드의 네이티브 USB 포트를 PS5에 연결합니다.
-3. 휠이 켜지고 캘리브레이션을 마치면 PS5가 G PRO로 인식합니다.
+3. 휠이 켜지고 캘리브레이션을 마쳐 준비되면 PS5가 G PRO로 인식합니다. PS 버튼을
+   누르면 사용할 수 있습니다.
+
+휠을 끄거나 뽑으면 브리지도 실제 컨트롤러처럼 PS5에서 분리됩니다(PS5에 연결 끊김이
+표시됩니다). 휠이 돌아오면 PS5가 새로 인식하므로, PS 버튼을 누르면 게임이 포스
+피드백을 다시 설정합니다.
 
 보드의 USB-A 포트에는 장치용 풀업 저항(R13)이 달려 있어서 루트 포트는 분리를
 감지하지 못합니다. 허브를 먼저 꽂은 다음 보드에 전원을 넣어(또는 다시 넣어)

@@ -62,23 +62,28 @@ const STATS_INTERVAL: Duration = Duration::from_secs(5);
 /// feedback up only once, loses it for good. The one cause seen so far was the host
 /// missing the wheel's handshakes and resending one packet (fixed in rp-pio-usb-host;
 /// docs/usb-host.md, "Lost handshakes").
-/// The FFB OUT task then asks [`serve_ep0`] to clear the endpoint halt
-/// ([`FFB_RECOVER`], answered through [`FFB_HALT_CLEARED`]) and replays the console's
-/// FFB set-up commands to the wheel.
+/// The FFB OUT task then takes the device off the console's bus
+/// ([`device::wheel_link`]), asks [`serve_ep0`] to clear the endpoint halt
+/// ([`FFB_RECOVER`], answered through [`FFB_HALT_CLEARED`]) and puts the device back:
+/// the console sets force feedback up again, as for a wheel plugged in anew.
 static FFB_RECOVER: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 static FFB_HALT_CLEARED: Signal<CriticalSectionRawMutex, bool> = Signal::new();
-/// Set while the set-up is replayed: the wheel's answers to it are not forwarded.
-static FFB_REPLAYING: AtomicBool = AtomicBool::new(false);
 /// At most one recovery per this long.
-const FFB_RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
-/// Console FFB set-up commands kept for a replay (GT7 sends ~60).
-const FFB_SETUP_MAX: usize = 96;
+const FFB_RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 /// FFB report command byte (`01 00 00 00 <cmd> <seq> ...`): the force stream is 0x01 to
-/// the wheel and 0x02 back; 0x05 with sequence 1 starts the console's set-up.
+/// the wheel (0x02 back).
 const FFB_CMD: usize = 4;
 const FFB_CMD_FORCE: u8 = 0x01;
-const FFB_CMD_STATUS: u8 = 0x02;
-const FFB_CMD_SETTING: u8 = 0x05;
+
+/// Takes the device off the console's bus when dropped, i.e. when the wheel is gone
+/// (this proxy is dropped on a detach) or its proxy gave up.
+struct WheelLink;
+
+impl Drop for WheelLink {
+    fn drop(&mut self) {
+        device::wheel_link(false);
+    }
+}
 
 /// An FFB packet taking this long to reach the wheel is logged.
 const SLOW_FFB_OUT: Duration = Duration::from_millis(20);
@@ -171,6 +176,7 @@ pub async fn run(
     };
 
     log::info!("proxy: forwarding c272 IF0/IF1/IF2 to the {}", PROFILE.name);
+    let _link = WheelLink;
     BACKEND_READY.signal(());
     join5(
         forward_input(bus, info, &if0_in),
@@ -205,12 +211,6 @@ pub async fn run(
             move |p| {
                 gap.tick();
                 count(&WHEEL_FFB);
-                // Answers to a replayed set-up are the bridge's, not the console's.
-                if FFB_REPLAYING.load(Ordering::Relaxed)
-                    && p.bytes().get(FFB_CMD).is_some_and(|&c| c != FFB_CMD_STATUS)
-                {
-                    return Ok(());
-                }
                 sampler.log("FFB wheel -> upstream", p.bytes());
                 FFB_IN.try_send(p)
             }
@@ -311,6 +311,8 @@ async fn serve_ep0(ep0: &mut ControlPipe) {
         log_feature_table(ep0).await;
         query_led_feature(ep0).await;
     }
+    // Awake: the device may go on the console's bus.
+    device::wheel_link(true);
 
     let mut ticker = Ticker::every(LIVENESS_INTERVAL);
     let mut responding = true;
@@ -530,8 +532,6 @@ async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDes
     };
     let mut sampler = Sampler::new();
     let mut report = [0u8; device::MAX_PACKET];
-    let mut setup = [Packet::new(&[]); FFB_SETUP_MAX];
-    let mut setup_len = 0usize;
     let mut last_recovery: Option<Instant> = None;
     loop {
         let packet = FFB_OUT.receive().await;
@@ -539,15 +539,6 @@ async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDes
         sampler.log("FFB upstream -> wheel", data);
         if carries_trueforce(data) {
             count(&FFB_TRUEFORCE);
-        }
-        if let [0x01, _, _, _, cmd, seq, ..] = *data {
-            if cmd == FFB_CMD_SETTING && seq == 0x01 {
-                setup_len = 0;
-            }
-            if cmd != FFB_CMD_FORCE && setup_len < FFB_SETUP_MAX {
-                setup[setup_len] = packet;
-                setup_len += 1;
-            }
         }
         report.fill(0);
         report[..data.len()].copy_from_slice(data);
@@ -570,9 +561,9 @@ async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDes
             Err(e) => {
                 log::warn!("proxy: FFB OUT failed: {:?}; packet dropped", e);
                 let due = last_recovery.is_none_or(|t| t.elapsed() >= FFB_RECOVERY_INTERVAL);
-                if e == PipeError::Stall && due && setup_len > 0 {
+                if e == PipeError::Stall && due && PROFILE.role == Role::Wheel {
                     last_recovery = Some(Instant::now());
-                    recover_ffb(&mut pipe, ep.endpoint_address, &setup[..setup_len]).await;
+                    recover_ffb(&mut pipe, ep.endpoint_address).await;
                 }
             }
         }
@@ -590,46 +581,21 @@ fn carries_trueforce(data: &[u8]) -> bool {
         && (data.len() > 12 || data.get(FFB_TF_SAMPLES).is_some_and(|&n| n != 0))
 }
 
-/// The wheel STALLed force feedback: clear the halt and replay the console's set-up.
+/// The wheel STALLed force feedback: off the console's bus, clear the halt, back on.
 async fn recover_ffb(
     pipe: &mut <HostBus as UsbHostAllocator<'static>>::Pipe<pipe::Interrupt, pipe::Out>,
     ep: u8,
-    setup: &[Packet],
 ) {
-    log::warn!(
-        "proxy: wheel stopped taking force feedback; recovering ({} set-up commands)",
-        setup.len()
-    );
+    log::warn!("proxy: wheel stopped taking force feedback; reconnecting to the console");
+    device::wheel_link(false);
     FFB_HALT_CLEARED.reset();
     FFB_RECOVER.signal(ep);
     match with_timeout(Duration::from_secs(1), FFB_HALT_CLEARED.wait()).await {
-        Ok(true) => {}
-        Ok(false) | Err(_) => {
-            log::warn!("proxy: FFB recovery: halt not cleared");
-            return;
-        }
+        Ok(true) => pipe.reset_data_toggle(),
+        Ok(false) | Err(_) => log::warn!("proxy: FFB recovery: halt not cleared"),
     }
-    pipe.reset_data_toggle();
-    FFB_REPLAYING.store(true, Ordering::Relaxed);
-    let mut report = [0u8; device::MAX_PACKET];
-    let mut failed = 0u32;
-    for packet in setup {
-        let data = packet.bytes();
-        report.fill(0);
-        report[..data.len()].copy_from_slice(data);
-        if pipe.request_out(&report, false).await.is_err() {
-            failed += 1;
-        }
-        Timer::after_millis(3).await;
-    }
-    // Let the wheel's answers to the replay arrive before forwarding them again.
-    Timer::after_millis(100).await;
-    FFB_REPLAYING.store(false, Ordering::Relaxed);
-    log::info!(
-        "proxy: FFB set-up replayed ({} commands, {} failed)",
-        setup.len(),
-        failed
-    );
+    // The device stays off the bus for `device::MIN_DETACH` whatever this says.
+    device::wheel_link(true);
 }
 
 pub(crate) fn open<D: pipe::Direction>(
