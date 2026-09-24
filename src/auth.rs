@@ -294,7 +294,10 @@ async fn sign(ep0: &mut ControlPipe, iface: u16, resend: bool) {
             }
         }
     }
-    log::warn!("auth: no complete signature after {} attempts", SIGN_ATTEMPTS);
+    log::warn!(
+        "auth: no complete signature after {} attempts",
+        SIGN_ATTEMPTS
+    );
     reset_signer(ep0, iface).await;
 }
 
@@ -341,8 +344,7 @@ async fn fetch_signature(ep0: &mut ControlPipe, iface: u16) -> Fetch {
                 last.copy_from_slice(&state[..3]);
             }
             seen_signing |= state[2] == STATE_SIGNING;
-            if state[2] == STATE_READY && (seen_signing || start.elapsed() >= STALE_READY_GRACE)
-            {
+            if state[2] == STATE_READY && (seen_signing || start.elapsed() >= STALE_READY_GRACE) {
                 break;
             }
         }

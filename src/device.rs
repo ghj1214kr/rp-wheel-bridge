@@ -17,7 +17,8 @@
 //! Data paths (the host side fills and drains the queues):
 //! - IF0 input: wheel role, the latest translated wheel report ([`set_input`]), sent at
 //!   every poll like a DS4 does; otherwise each backend report ([`INPUT_IN`]).
-//! - IF0 output (0x05, 0x30): relay, to DriveHub ([`IF0_OUT`]); wheel role, logged.
+//! - IF0 output (0x05, 0x30): to the backend's side ([`IF0_OUT`]): relay, to DriveHub;
+//!   wheel role, rev lights for the wheel (`crate::proxy`).
 //! - IF1 HID++: backend reports → [`HIDPP_IN`] → IN endpoint; SET_REPORT → [`CONTROL_OUT`].
 //! - IF2 force feedback: backend reports → [`FFB_IN`] → IN endpoint; OUT → [`FFB_OUT`].
 //! - c269: IF0 feature 0x03/0x31 are answered with DriveHub's values; auth (F0-F3)
@@ -481,7 +482,7 @@ async fn if0_output(ep: Option<&mut impl EndpointOut>) -> ! {
                 last = packet;
                 repeats = 0;
             }
-            if PROFILE.role == Role::Relay && IF0_OUT.try_send(packet).is_err() {
+            if PROFILE.role != Role::Mirror && IF0_OUT.try_send(packet).is_err() {
                 count(&STATS.dropped);
             }
         }
@@ -523,7 +524,10 @@ async fn forward_in<const N: usize>(
 /// IF2 OUT (force feedback) → wheel.
 async fn forward_ffb_out(ep: &mut impl EndpointOut) -> ! {
     let mut buf = [0u8; MAX_PACKET];
-    let mut gap = GapMeter::new("FFB console -> bridge", embassy_time::Duration::from_millis(100));
+    let mut gap = GapMeter::new(
+        "FFB console -> bridge",
+        embassy_time::Duration::from_millis(100),
+    );
     loop {
         ep.wait_enabled().await;
         while let Ok(n) = ep.read(&mut buf).await {

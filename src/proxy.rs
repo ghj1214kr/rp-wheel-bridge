@@ -24,10 +24,10 @@
 //! Mirror mode sends nothing of its own: finding out what the wheel's host sends is the
 //! point of it.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use embassy_futures::join::{join, join5};
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either3, select3};
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use embassy_usb_driver::EndpointInfo;
 use embassy_usb_driver::host::{PipeError, UsbHostAllocator, UsbPipe, pipe};
@@ -37,7 +37,7 @@ use embassy_usb_host::handler::EnumerationInfo;
 
 use crate::device::{
     self, BACKEND_READY, CONTROL_OUT, ControlOut, FFB_IN, FFB_OUT, HID_SET_REPORT, HIDPP_IN,
-    IF_HIDPP, INPUT_IN, PROFILE, Packet, Role, STATS,
+    IF_HIDPP, IF0_OUT, INPUT_IN, PROFILE, Packet, Role, STATS,
 };
 use crate::hid::{GapMeter, Hex, HidInterface, MAX_HID_INTERFACES};
 use crate::usb_host::{ControlPipe, HostBus, open_ep0};
@@ -68,6 +68,25 @@ const GET_STATUS: [u8; 8] = [0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00];
 
 /// SET_REPORT wValue for a HID++ short report: Output (0x02) << 8 | report ID 0x10.
 const HIDPP_SHORT_OUTPUT: u16 = 0x0210;
+/// The same for a long report (ID 0x11, 20 bytes).
+const HIDPP_LONG_OUTPUT: u16 = 0x0211;
+const HIDPP_LONG_LEN: usize = 20;
+
+/// Software ID of the bridge's own HID++ requests. The wheel's answers carrying it are
+/// the bridge's and are not forwarded.
+const BRIDGE_SWID: u8 = 0x0b;
+
+/// IRoot (index 0) function 0 getFeature(0x807a, LED effects), software ID 0xB.
+const GET_FEATURE_LEDS: [u8; 7] = [0x10, 0xff, 0x00, 0x0b, 0x80, 0x7a, 0x00];
+
+/// Wheel feature index of 0x807a (0: unknown or absent), from [`GET_FEATURE_LEDS`].
+static LED_FEATURE: AtomicU8 = AtomicU8::new(0);
+static LED_FEATURE_ANSWERED: AtomicBool = AtomicBool::new(false);
+const FEATURE_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// PS5 IF0 output report 0x30, G29 command `f8 12 <mask>`: rev lights, one bit per
+/// LED (5 LEDs).
+const REV_LIGHTS: [u8; 2] = [0xf8, 0x12];
 
 /// How the bridge keeps a freshly booted wheel on.
 #[allow(dead_code)] // one variant is selected at a time while this is being narrowed down
@@ -134,11 +153,19 @@ pub async fn run(
         forward_input(bus, info, &if0_in),
         forward_in(bus, info, &if1_in, "HID++", |p| {
             count(&WHEEL_HIDPP);
-            if WAKING.load(Ordering::Relaxed) {
-                log_hidpp("wheel -> bridge", p.bytes());
-                // Byte 3 is function << 4 | software ID; notifications have ID 0.
-                if p.bytes().get(3).is_some_and(|b| b & 0x0f != 0) {
+            let b = p.bytes();
+            // Byte 3 is function << 4 | software ID; notifications have ID 0.
+            let swid = b.get(3).map_or(0, |x| x & 0x0f);
+            let waking = WAKING.load(Ordering::Relaxed);
+            if waking || swid == BRIDGE_SWID {
+                log_hidpp("wheel -> bridge", b);
+                if waking && swid != 0 {
                     WHEEL_ANSWERED.store(true, Ordering::Relaxed);
+                }
+                // getFeature answer: IRoot (index 0), function 0, feature index in byte 4.
+                if swid == BRIDGE_SWID && b.get(2) == Some(&0) && b[3] >> 4 == 0 {
+                    LED_FEATURE.store(b.get(4).copied().unwrap_or(0), Ordering::Relaxed);
+                    LED_FEATURE_ANSWERED.store(true, Ordering::Relaxed);
                 }
                 return Ok(());
             }
@@ -248,16 +275,22 @@ async fn serve_ep0(ep0: &mut ControlPipe) {
         WAKING.store(false, Ordering::Relaxed);
     }
 
+    if PROFILE.role != Role::Mirror {
+        query_led_feature(ep0).await;
+    }
+
     let mut ticker = Ticker::every(LIVENESS_INTERVAL);
     let mut responding = true;
+    let mut rev_level = None;
     loop {
-        match select(CONTROL_OUT.receive(), ticker.next()).await {
-            Either::First(msg) => {
+        match select3(CONTROL_OUT.receive(), IF0_OUT.receive(), ticker.next()).await {
+            Either3::First(msg) => {
                 if repeat_control(ep0, &msg, "upstream -> wheel").await {
                     count(&HIDPP_WRITTEN);
                 }
             }
-            Either::Second(()) => {
+            Either3::Second(report) => rev_lights(ep0, report.bytes(), &mut rev_level).await,
+            Either3::Third(()) => {
                 let mut status = [0u8; 2];
                 let result = ep0.control_in(&GET_STATUS, &mut status).await;
                 match (result, responding) {
@@ -270,6 +303,81 @@ async fn serve_ep0(ep0: &mut ControlPipe) {
                 responding = result.is_ok();
             }
         }
+    }
+}
+
+/// Ask the wheel for the index of its LED effects feature (0x807a).
+async fn query_led_feature(ep0: &mut ControlPipe) {
+    LED_FEATURE_ANSWERED.store(false, Ordering::Relaxed);
+    log_hidpp("bridge -> wheel", &GET_FEATURE_LEDS);
+    if let Err(e) = ep0
+        .control_out(&hidpp_short_setup(), &GET_FEATURE_LEDS)
+        .await
+    {
+        log::warn!("proxy: getFeature(0x807a) failed: {:?}", e);
+        return;
+    }
+    let start = Instant::now();
+    while !LED_FEATURE_ANSWERED.load(Ordering::Relaxed) {
+        if start.elapsed() >= FEATURE_QUERY_TIMEOUT {
+            log::warn!("proxy: no answer to getFeature(0x807a); rev lights off");
+            return;
+        }
+        Timer::after_millis(5).await;
+    }
+    let index = LED_FEATURE.load(Ordering::Relaxed);
+    if index == 0 {
+        log::warn!("proxy: wheel has no LED effects feature (0x807a)");
+        return;
+    }
+    log::info!(
+        "proxy: LED effects (0x807a) at feature index {:#04x}",
+        index
+    );
+}
+
+/// PS5 rev lights (IF0 output `30 f8 12 <mask>`, 5 LEDs as bits) → the wheel's 10 rev
+/// LEDs: 0x807a function 6 `00 01 00 0a 00 <level>`, level 0-10 (DriveHub sends the
+/// same command), 2 levels per PS5 LED. How a level is drawn (center-out pairs, a sweep
+/// from one side, ...) is the wheel's LED profile. Sent on change.
+///
+/// DriveHub maps differently: it was seen sending only 04-0a, lighting up at high revs
+/// only; its exact mapping is not known.
+async fn rev_lights(ep0: &mut ControlPipe, report: &[u8], last: &mut Option<u8>) {
+    let [0x30, a, b, mask, ..] = *report else {
+        return;
+    };
+    let index = LED_FEATURE.load(Ordering::Relaxed);
+    if [a, b] != REV_LIGHTS || index == 0 {
+        return;
+    }
+    let lit = (mask & 0x1f).count_ones() as u8 * 2;
+    if *last == Some(lit) {
+        return;
+    }
+    *last = Some(lit);
+    let mut msg = [0u8; HIDPP_LONG_LEN];
+    msg[..10].copy_from_slice(&[
+        0x11,
+        0xff,
+        index,
+        0x60 | BRIDGE_SWID,
+        0x00,
+        0x01,
+        0x00,
+        0x0a,
+        0x00,
+        lit,
+    ]);
+    log_hidpp("bridge -> wheel (rev lights)", &msg);
+    let setup = SetupPacket::class_interface_out(
+        HID_SET_REPORT,
+        HIDPP_LONG_OUTPUT,
+        IF_HIDPP,
+        msg.len() as u16,
+    );
+    if let Err(e) = ep0.control_out(&setup.to_bytes(), &msg).await {
+        log::warn!("proxy: rev lights failed: {:?}", e);
     }
 }
 
@@ -332,7 +440,10 @@ async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDes
         let result = pipe.request_out(&report, false).await;
         let took = sent.elapsed();
         if took >= SLOW_FFB_OUT {
-            log::info!("FFB bridge -> wheel: one packet took {} ms", took.as_millis());
+            log::info!(
+                "FFB bridge -> wheel: one packet took {} ms",
+                took.as_millis()
+            );
         }
         match result {
             Ok(()) => count(&FFB_WRITTEN),

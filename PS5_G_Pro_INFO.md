@@ -404,8 +404,11 @@ Consequences for the bridge's own PS5 mode (c272 behind it):
 
 - Pad FFB OUT to 64 bytes. Done.
 - Translate 0x30 `f8 81 lo hi` into HID++ 0x8138 set range.
-- Translate `f8 12 mask` into rev LEDs (0x807a fn 6). The mask → HID++ value mapping
-  (`00 01 00 0a 00 NN`, NN 04/06/08/0a seen) still needs a correlated capture.
+- Translate `f8 12 mask` into rev LEDs (0x807a fn 6). Done (2026-09-24): `00 01 00 0a
+  00 LEVEL` is a rev-light level 0-10 (mescon PROTOCOL_SPECIFICATION.md, "level stream";
+  the wheel draws it per its LED profile, center-out by default). The bridge sends
+  level = 2 × lit PS5 LEDs, on change. DriveHub's own mapping lights up only at high
+  revs (it sent 04-0a only) and is not known exactly.
 - `f3/f4/f5/13/f8 04 01` are G29 autocenter/force-slot commands. The native FFB stream
   makes them irrelevant, probably.
 
