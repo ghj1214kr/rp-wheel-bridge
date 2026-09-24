@@ -70,8 +70,6 @@ the hub can be plugged and unplugged freely.
 
 ### Limitations
 
-- The wheel range command from the console is not translated; the wheel keeps its
-  own setting (e.g. an onboard profile).
 - Occasional USB errors on the PIO bus are recovered automatically. The wheel has
   been seen to drop out of force feedback a few times; see
   [docs/usb-host.md](docs/usb-host.md#known-issues).
@@ -157,8 +155,6 @@ cargo run --release      # picotool load --update --verify --execute
 
 ### 한계
 
-- 콘솔이 보내는 휠 회전 범위 명령은 변환하지 않습니다. 휠은 자체 설정(예: 내장
-  프로파일)을 그대로 씁니다.
 - PIO 버스의 간헐적인 USB 오류는 자동으로 복구됩니다. 휠이 포스 피드백에서 빠지는
   현상이 몇 번 있었습니다. [docs/usb-host.md](docs/usb-host.md#known-issues)를
   참고하세요.

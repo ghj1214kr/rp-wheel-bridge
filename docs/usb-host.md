@@ -137,5 +137,3 @@ wheel base (the bridge talks to 0xff).
   through a port reset was not tried. The cause is not known; the bridge logs pauses
   over 100 ms in the FFB streams and FFB packets taking over 20 ms to reach the
   wheel.
-- Wheel range commands (`f8 81`) are not translated; the wheel keeps its own
-  setting.

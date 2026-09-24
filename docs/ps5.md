@@ -23,7 +23,7 @@ wheel needs beyond force feedback comes as G29-style commands on IF0 output 0x30
 
 | command | meaning | bridge |
 |---|---|---|
-| `f8 81 <lo> <hi>` | wheel range in degrees: `38 04` = 1080 at start-up, `84 03` = 900 in GT7 | not translated (the wheel keeps its own setting; DriveHub sends HID++ 0x8138) |
+| `f8 81 <lo> <hi>` | wheel range in degrees: `38 04` = 1080 at start-up, `84 03` = 900 in GT7 | ignored: GT7 sets the range through force feedback type 0x0e, sent with it ([below](#steering-range)); DriveHub turns this into HID++ 0x8138 |
 | `f8 12 <mask>` | rev lights, 5 LEDs as bits (01, 03, 07, 0f, 1f); GT7 flickers between neighbours at the shift point | translated to 0x807a function 6, level = 2 × lit LEDs |
 | `f3`, `f4`, `f5`, `13`, `f8 04 01` | G29 autocenter / force-slot commands | ignored; the native FFB stream makes them irrelevant |
 
@@ -66,7 +66,17 @@ records every non-stream command):
 01 00 00 00 0c 4a 8f c2 75 3d
 ```
 
-The console sends this only once. If the wheel drops out of force feedback later
+### Steering range
+
+GT7 sets the wheel's rotation with FFB type 0x0e (`01 00 00 00 0e <seq> <f32 LE
+degrees>`), forwarded unchanged: `00 00 87 44` = 1080 in the menus, and a
+car-dependent range at race start (`00 00 61 44` = 900 for a road car; racing cars
+get less). The wheel applies it at once and notifies the new value (`12 ff 16 00
+<hi> <lo>`). The G29-style `f8 81` arrives at the same moments and is not needed.
+Per the TrueForce driver's notes, a 0x0e push only takes effect while the stream is
+started (after type 0x03).
+
+The console sends the set-up only once. If the wheel drops out of force feedback later
 (it notifies `12 ff 1f 00 20` and re-announces its rotation `12 ff 16 00 03 84`,
 then STALLs FFB OUT), force feedback stays off; see
 [usb-host.md](usb-host.md#known-issues).
