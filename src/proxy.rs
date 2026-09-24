@@ -27,8 +27,10 @@
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use embassy_futures::join::{join, join5};
-use embassy_futures::select::{Either3, select3};
-use embassy_time::{Duration, Instant, Ticker, Timer};
+use embassy_futures::select::{Either4, select4};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Instant, Ticker, Timer, with_timeout};
 use embassy_usb_driver::EndpointInfo;
 use embassy_usb_driver::host::{PipeError, UsbHostAllocator, UsbPipe, pipe};
 use embassy_usb_host::control::SetupPacket;
@@ -55,6 +57,28 @@ const HID_SET_IDLE: u8 = 0x0a;
 const FFB_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
+/// Force feedback recovery. Now and then the wheel stops taking force feedback: it
+/// STALLs its FFB OUT endpoint and notifies `12 ff 1f 00 20`, and the console, which
+/// sets force feedback up only once, loses it for good. It happened each time the
+/// auth pad STALLed a nonce page on the same hub, at that very moment (cause unknown).
+/// The FFB OUT task then asks [`serve_ep0`] to clear the endpoint halt
+/// ([`FFB_RECOVER`], answered through [`FFB_HALT_CLEARED`]) and replays the console's
+/// FFB set-up commands to the wheel.
+static FFB_RECOVER: Signal<CriticalSectionRawMutex, u8> = Signal::new();
+static FFB_HALT_CLEARED: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+/// Set while the set-up is replayed: the wheel's answers to it are not forwarded.
+static FFB_REPLAYING: AtomicBool = AtomicBool::new(false);
+/// At most one recovery per this long.
+const FFB_RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
+/// Console FFB set-up commands kept for a replay (GT7 sends ~60).
+const FFB_SETUP_MAX: usize = 96;
+/// FFB report command byte (`01 00 00 00 <cmd> <seq> ...`): the force stream is 0x01 to
+/// the wheel and 0x02 back; 0x05 with sequence 1 starts the console's set-up.
+const FFB_CMD: usize = 4;
+const FFB_CMD_FORCE: u8 = 0x01;
+const FFB_CMD_STATUS: u8 = 0x02;
+const FFB_CMD_SETTING: u8 = 0x05;
+
 /// An FFB packet taking this long to reach the wheel is logged.
 const SLOW_FFB_OUT: Duration = Duration::from_millis(20);
 
@@ -179,6 +203,12 @@ pub async fn run(
             move |p| {
                 gap.tick();
                 count(&WHEEL_FFB);
+                // Answers to a replayed set-up are the bridge's, not the console's.
+                if FFB_REPLAYING.load(Ordering::Relaxed)
+                    && p.bytes().get(FFB_CMD).is_some_and(|&c| c != FFB_CMD_STATUS)
+                {
+                    return Ok(());
+                }
                 sampler.log("FFB wheel -> upstream", p.bytes());
                 FFB_IN.try_send(p)
             }
@@ -283,14 +313,28 @@ async fn serve_ep0(ep0: &mut ControlPipe) {
     let mut responding = true;
     let mut rev_level = None;
     loop {
-        match select3(CONTROL_OUT.receive(), IF0_OUT.receive(), ticker.next()).await {
-            Either3::First(msg) => {
+        match select4(
+            CONTROL_OUT.receive(),
+            IF0_OUT.receive(),
+            FFB_RECOVER.wait(),
+            ticker.next(),
+        )
+        .await
+        {
+            Either4::First(msg) => {
                 if repeat_control(ep0, &msg, "upstream -> wheel").await {
                     count(&HIDPP_WRITTEN);
                 }
             }
-            Either3::Second(report) => rev_lights(ep0, report.bytes(), &mut rev_level).await,
-            Either3::Third(()) => {
+            Either4::Second(report) => rev_lights(ep0, report.bytes(), &mut rev_level).await,
+            Either4::Third(ep) => {
+                // CLEAR_FEATURE(ENDPOINT_HALT) to endpoint `ep`.
+                let setup = [0x02, 0x01, 0x00, 0x00, ep, 0x00, 0x00, 0x00];
+                let result = ep0.control_out(&setup, &[]).await;
+                log::info!("proxy: clear halt on EP {:#04x}: {:?}", ep, result);
+                FFB_HALT_CLEARED.signal(result.is_ok());
+            }
+            Either4::Fourth(()) => {
                 let mut status = [0u8; 2];
                 let result = ep0.control_in(&GET_STATUS, &mut status).await;
                 match (result, responding) {
@@ -430,10 +474,22 @@ async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDes
     };
     let mut sampler = Sampler::new();
     let mut report = [0u8; device::MAX_PACKET];
+    let mut setup = [Packet::new(&[]); FFB_SETUP_MAX];
+    let mut setup_len = 0usize;
+    let mut last_recovery: Option<Instant> = None;
     loop {
         let packet = FFB_OUT.receive().await;
         let data = packet.bytes();
         sampler.log("FFB upstream -> wheel", data);
+        if let [0x01, _, _, _, cmd, seq, ..] = *data {
+            if cmd == FFB_CMD_SETTING && seq == 0x01 {
+                setup_len = 0;
+            }
+            if cmd != FFB_CMD_FORCE && setup_len < FFB_SETUP_MAX {
+                setup[setup_len] = packet;
+                setup_len += 1;
+            }
+        }
         report.fill(0);
         report[..data.len()].copy_from_slice(data);
         let sent = Instant::now();
@@ -452,9 +508,58 @@ async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDes
                 log::warn!("proxy: FFB OUT failed: {:?}; stopped", e);
                 return;
             }
-            Err(e) => log::warn!("proxy: FFB OUT failed: {:?}; packet dropped", e),
+            Err(e) => {
+                log::warn!("proxy: FFB OUT failed: {:?}; packet dropped", e);
+                let due = last_recovery.is_none_or(|t| t.elapsed() >= FFB_RECOVERY_INTERVAL);
+                if e == PipeError::Stall && due && setup_len > 0 {
+                    last_recovery = Some(Instant::now());
+                    recover_ffb(&mut pipe, ep.endpoint_address, &setup[..setup_len]).await;
+                }
+            }
         }
     }
+}
+
+/// The wheel STALLed force feedback: clear the halt and replay the console's set-up.
+async fn recover_ffb(
+    pipe: &mut <HostBus as UsbHostAllocator<'static>>::Pipe<pipe::Interrupt, pipe::Out>,
+    ep: u8,
+    setup: &[Packet],
+) {
+    log::warn!(
+        "proxy: wheel stopped taking force feedback; recovering ({} set-up commands)",
+        setup.len()
+    );
+    FFB_HALT_CLEARED.reset();
+    FFB_RECOVER.signal(ep);
+    match with_timeout(Duration::from_secs(1), FFB_HALT_CLEARED.wait()).await {
+        Ok(true) => {}
+        Ok(false) | Err(_) => {
+            log::warn!("proxy: FFB recovery: halt not cleared");
+            return;
+        }
+    }
+    pipe.reset_data_toggle();
+    FFB_REPLAYING.store(true, Ordering::Relaxed);
+    let mut report = [0u8; device::MAX_PACKET];
+    let mut failed = 0u32;
+    for packet in setup {
+        let data = packet.bytes();
+        report.fill(0);
+        report[..data.len()].copy_from_slice(data);
+        if pipe.request_out(&report, false).await.is_err() {
+            failed += 1;
+        }
+        Timer::after_millis(3).await;
+    }
+    // Let the wheel's answers to the replay arrive before forwarding them again.
+    Timer::after_millis(100).await;
+    FFB_REPLAYING.store(false, Ordering::Relaxed);
+    log::info!(
+        "proxy: FFB set-up replayed ({} commands, {} failed)",
+        setup.len(),
+        failed
+    );
 }
 
 pub(crate) fn open<D: pipe::Direction>(

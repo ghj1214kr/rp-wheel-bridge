@@ -55,6 +55,9 @@ const STATE_READY: u8 = 0x00;
 
 /// How often the signer's F2 is polled, and for how long.
 const SIGNER_POLL: Duration = Duration::from_millis(20);
+/// Reads of a candidate signer's F3 before it is taken for something else.
+const SIGNER_PROBE_TRIES: u32 = 5;
+const SIGNER_PROBE_PAUSE: Duration = Duration::from_millis(200);
 const SIGNER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Signing runs per console nonce. The HORI OCTA steps its F1 page on every GET it
 /// takes, also one whose reply is lost (500 ms timeout) or a SETUP resent after a
@@ -193,16 +196,28 @@ fn send(cmd: Cmd) {
 
 /// Read the signer's F3 (on HID interface `iface`) and answer the console's F3 with it
 /// from now on. Returns whether the device answered, i.e. can sign.
+///
+/// Tried a few times: one lost reply (a timeout right after the OCTA enumerated) once
+/// left a whole session without a signer, and the console, never authenticated,
+/// stopped taking the buttons and pedals after a few minutes.
 pub async fn try_signer(ep0: &mut ControlPipe, iface: u16) -> bool {
     let mut buf = [0u8; RESET_LEN];
-    match get_feature(ep0, iface, ID_RESET, &mut buf).await {
-        Some(n) => {
+    for attempt in 1..=SIGNER_PROBE_TRIES {
+        if let Some(n) = get_feature(ep0, iface, ID_RESET, &mut buf).await {
             log::info!("auth: signer F3 = {}", Hex(&buf[..n]));
             STATE.lock(|s| s.borrow_mut().reset = buf);
-            true
+            return true;
         }
-        None => false,
+        if attempt < SIGNER_PROBE_TRIES {
+            Timer::after(SIGNER_PROBE_PAUSE).await;
+        }
     }
+    log::info!(
+        "auth: IF{} gave no F3 in {} tries; not a signer",
+        iface,
+        SIGNER_PROBE_TRIES
+    );
+    false
 }
 
 /// Wheel role: act on the console's auth events with this signer until a transfer
