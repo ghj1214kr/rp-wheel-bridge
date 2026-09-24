@@ -85,8 +85,7 @@ the hub can be plugged and unplugged freely.
 
 ### Limitations
 
-- Occasional USB errors on the PIO bus are recovered automatically. The wheel has
-  been seen to drop out of force feedback a few times; see
+- Occasional USB errors on the PIO bus are recovered automatically; see
   [docs/usb-host.md](docs/usb-host.md#known-issues).
 - TRUEFORCE needs vibration switched on for controller 1: with it off, GT7 sends
   force feedback without TRUEFORCE samples ([docs/ps5.md](docs/ps5.md#trueforce)).
@@ -193,9 +192,8 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/rp-wheel-bridge -t
 
 ### 한계
 
-- PIO 버스의 간헐적인 USB 오류는 자동으로 복구됩니다. 휠이 포스 피드백에서 빠지는
-  현상이 몇 번 있었습니다. [docs/usb-host.md](docs/usb-host.md#known-issues)를
-  참고하세요.
+- PIO 버스의 간헐적인 USB 오류는 자동으로 복구됩니다.
+  [docs/usb-host.md](docs/usb-host.md#known-issues)를 참고하세요.
 - TRUEFORCE를 쓰려면 컨트롤러 1의 진동을 켜야 합니다. 꺼져 있으면 GT7은 TRUEFORCE
   샘플 없이 포스 피드백만 보냅니다([docs/ps5.md](docs/ps5.md#trueforce)).
 

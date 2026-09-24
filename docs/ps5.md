@@ -78,8 +78,8 @@ started (after type 0x03).
 
 The console sends the set-up only once. If the wheel drops out of force feedback later
 (it notifies `12 ff 1f 00 20` and re-announces its rotation `12 ff 16 00 03 84`,
-then STALLs FFB OUT), force feedback stays off; see
-[usb-host.md](usb-host.md#known-issues).
+then STALLs FFB OUT), force feedback stays off; the one cause seen so far was on the
+bridge's side, see [usb-host.md](usb-host.md#the-held-bus).
 
 ## TRUEFORCE
 

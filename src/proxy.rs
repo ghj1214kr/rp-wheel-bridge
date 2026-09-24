@@ -57,10 +57,10 @@ const HID_SET_IDLE: u8 = 0x0a;
 const FFB_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
-/// Force feedback recovery. Now and then the wheel stops taking force feedback: it
-/// STALLs its FFB OUT endpoint and notifies `12 ff 1f 00 20`, and the console, which
-/// sets force feedback up only once, loses it for good. It happened each time the
-/// auth pad STALLed a nonce page on the same hub, at that very moment (cause unknown).
+/// Force feedback recovery. If the wheel stops taking force feedback, it STALLs its FFB
+/// OUT endpoint and notifies `12 ff 1f 00 20`, and the console, which sets force
+/// feedback up only once, loses it for good. The one cause seen so far was the host
+/// holding the bus after its packets (fixed in rp-pio-usb-host; docs/usb-host.md).
 /// The FFB OUT task then asks [`serve_ep0`] to clear the endpoint halt
 /// ([`FFB_RECOVER`], answered through [`FFB_HALT_CLEARED`]) and replays the console's
 /// FFB set-up commands to the wheel.
@@ -794,5 +794,24 @@ async fn log_stats() {
             take(&FFB_TRUEFORCE),
             take(&STATS.dropped),
         );
+        // Host bus anomalies (rp-pio-usb-host). Handshakes missed after an OUT/SETUP
+        // ("none", tens per second, retried) alone are not logged.
+        let d = rp_pio_usb_host::diag::take();
+        let rare = rp_pio_usb_host::diag::Counters {
+            hs_no_reply: 0,
+            ..d
+        };
+        if !rare.is_clean() {
+            log::info!(
+                "PIO USB: EOP timeout {}, bus held after TX {}, handshake after OUT/SETUP: none {}, short {}, STALL {}, other {} (last {:#04x})",
+                d.tx_eop_timeout,
+                d.tx_bus_held,
+                d.hs_no_reply,
+                d.hs_short,
+                d.hs_stall,
+                d.hs_other,
+                d.hs_other_last_pid,
+            );
+        }
     }
 }

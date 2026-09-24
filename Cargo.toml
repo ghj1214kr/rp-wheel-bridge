@@ -98,6 +98,6 @@ debug = false
 opt-level = 0
 
 # Fork of rp-pio-usb-host (branch sof-during-transfers): hardware-timed SOF, SOFs during
-# transfers, stage-by-stage control transfers.
+# transfers, stage-by-stage control transfers, bus release after each packet, diagnostics.
 [patch.crates-io]
-rp-pio-usb-host = { git = "https://github.com/ghj1214kr/rp-pio-usb-host", rev = "ebafabb814f7c0c5cfdd7abba44171e2d65304b6" }
+rp-pio-usb-host = { git = "https://github.com/ghj1214kr/rp-pio-usb-host", rev = "2d4b4c65858e5eed1c40ed234e083ab7474ca6c3" }

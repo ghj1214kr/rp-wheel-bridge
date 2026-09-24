@@ -44,6 +44,11 @@ The bridge uses a fork (branch `sof-during-transfers`) with:
 - **SOFs during transfers**, and transfers kept clear of the frame boundary.
 - **Stage-by-stage control transfers:** SETUP is resent only without an ACK. Resending
   an ACKed SETUP restarts the request (a hub's port reset never completed).
+- **Bus release after each packet:** if D+/D- are still driven 2 µs after a packet's
+  EOP, the host releases them itself ([below](#the-held-bus)).
+- **Diagnostics:** counters for these releases and for OUT/SETUP handshake outcomes
+  (`rp_pio_usb_host::diag::take()`); the bridge logs them in its 5 s statistics
+  when anything besides missed handshakes shows up.
 
 ### The SM0 pitfall
 
@@ -55,6 +60,31 @@ silent after SET_FEATURE(PORT_RESET) and did not answer at address 0 after a bus
 reset. The fix keeps SM0 disabled whenever it is idle (after each packet, and after a
 bus reset). Found with a loopback capture of our own SOF and a probe of the PIO pad
 debug registers.
+
+### The held bus
+
+The wheel dropped out of force feedback about once every half hour to hour: its
+force feedback stopped, steering stopped working in the game, and its control
+endpoint seemed dead. Each time, the auth pad had just "STALLed" a nonce page. A USB
+sniffer ([usb-sniffer-lite](https://github.com/ataradov/usb-sniffer-lite), changed to
+keep the packets before a trigger) on the wheel's cable, triggered by the bridge at
+that STALL, showed what happened:
+
+- From that moment the wheel ACKed every OUT and SETUP from the host, but the host
+  took none of the ACKs: it resent the same force packet every 2 ms for good, and
+  every GET_STATUS SETUP too. DATA from the wheel (IN) was still received.
+- To the wheel the force stream had stopped (the same packet over and over), so
+  after ~0.5 s it switched its force feedback off (`12 ff 1f 00 20`) and announced
+  its rotation again, as at power-up.
+
+The host was still driving the bus after its packets. The TX player releases D+/D-
+right after EOP, and the IN path releases them explicitly before a reply; the
+OUT/SETUP path relied on the player alone, waited up to 50 µs for the release and
+then went on with the bus held, so the device's handshake collided with our idle J.
+The fork now releases the bus itself when it is still driven 2 µs after EOP. In a
+54-minute drive it had to do so 586 times (up to 15 times in 5 s), and the wheel
+never dropped out; before, it was a matter of time. What keeps the pins driven is
+not known yet (a suspect: the hardware SOF state machine on the same pins).
 
 ## Hub
 
@@ -119,21 +149,14 @@ wheel base (the bridge talks to 0xff).
 
 ## Known issues
 
-- **Sporadic bus errors:** a few per minute, mostly garbled handshakes read as STALL
-  (FFB IN, IF0 IN, the 1 s GET_STATUS liveness check) and lost OCTA replies. All are
-  recovered automatically: IN endpoints are polled on, FFB OUT drops just the packet,
-  auth signs again. A fork change that stopped the SOF-preparation interrupt from
-  retrying during transfers and re-checked the RX start flag did not reduce them and
-  was dropped.
-- **Wheel dropping out of force feedback:** seen five times, each at the very moment
-  the OCTA answered a nonce page (SET F0) with STALL, on both a powered and an
-  unpowered hub; a SET F0 timeout never did it. The wheel NAKs and then STALLs
-  FFB OUT, notifies `12 ff 1f 00 20` + `12 ff 16 00 03 84` about 0.5 s later (the
-  notifications it sends at power-up, so its force feedback side seems to restart),
-  and usually stops answering control transfers for good while its input reports go
-  on. The console stops force feedback, and steering no longer works in the game.
-  The bridge then clears the FFB OUT halt and replays the console's FFB set-up, which
-  cannot help while the wheel's control endpoint is dead. Re-enumerating the wheel
-  through a port reset was not tried. The cause is not known; the bridge logs pauses
-  over 100 ms in the FFB streams and FFB packets taking over 20 ms to reach the
-  wheel.
+- **Missed handshakes:** tens per second, the host gets no handshake after an OUT
+  or SETUP; the transaction is retried. Possibly related to [the held
+  bus](#the-held-bus); not investigated yet.
+- **Sporadic bus errors:** now and then a garbled handshake read as STALL (FFB IN,
+  IF0 IN, the 1 s GET_STATUS liveness check) or a lost OCTA reply. All are recovered
+  automatically: IN endpoints are polled on, FFB OUT drops just the packet, auth signs
+  again. Many of them were probably [the held bus](#the-held-bus).
+- **Wheel dropping out of force feedback:** fixed, see [the held bus](#the-held-bus).
+  Should it still happen (the wheel STALLs FFB OUT), the bridge clears the halt and
+  replays the console's FFB set-up. It logs pauses over 100 ms in the FFB streams and
+  FFB packets taking over 20 ms to reach the wheel.
