@@ -174,8 +174,9 @@ wheel base (the bridge talks to 0xff).
   All are recovered automatically: IN endpoints are polled on, FFB OUT drops just the
   packet, auth signs again. Most of the earlier ones were [lost
   handshakes](#lost-handshakes).
-- **Wheel dropping out of force feedback:** fixed, see [lost
-  handshakes](#lost-handshakes).
-  Should it still happen (the wheel STALLs FFB OUT), the bridge clears the halt and
-  replays the console's FFB set-up. It logs pauses over 100 ms in the FFB streams and
-  FFB packets taking over 20 ms to reach the wheel.
+- **Force feedback recovery is untested:** should the wheel still drop out of force
+  feedback (it STALLs FFB OUT; the one cause seen so far is fixed, see [lost
+  handshakes](#lost-handshakes)), the bridge clears the halt and replays the console's
+  FFB set-up, but whether the console then carries on was never seen. The bridge logs
+  pauses over 100 ms in the FFB streams and FFB packets taking over 20 ms to reach the
+  wheel.

@@ -85,10 +85,17 @@ the hub can be plugged and unplugged freely.
 
 ### Limitations
 
-- Occasional USB errors on the PIO bus are recovered automatically; see
-  [docs/usb-host.md](docs/usb-host.md#known-issues).
+- Tested with Gran Turismo 7 only.
 - TRUEFORCE needs vibration switched on for controller 1: with it off, GT7 sends
   force feedback without TRUEFORCE samples ([docs/ps5.md](docs/ps5.md#trueforce)).
+- The PS5 does not talk HID++, so the wheel's own settings (force feedback strength,
+  TRUEFORCE level, damping, ...) come from its onboard profile. The steering range is
+  set by the game. Tested with the wheel on an onboard profile, not in G HUB mode.
+- The host port takes full-speed devices only, up to three behind one hub. Because of
+  the board's pull-up (R13) the hub must be plugged in before the board is powered.
+- USB errors on the PIO bus now and then (a few missed handshakes per second while
+  force feedback streams) are retried and recovered automatically; see
+  [docs/usb-host.md](docs/usb-host.md#known-issues).
 
 ### Documentation
 
@@ -192,10 +199,17 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/rp-wheel-bridge -t
 
 ### 한계
 
-- PIO 버스의 간헐적인 USB 오류는 자동으로 복구됩니다.
-  [docs/usb-host.md](docs/usb-host.md#known-issues)를 참고하세요.
+- 그란 투리스모 7에서만 테스트했습니다.
 - TRUEFORCE를 쓰려면 컨트롤러 1의 진동을 켜야 합니다. 꺼져 있으면 GT7은 TRUEFORCE
   샘플 없이 포스 피드백만 보냅니다([docs/ps5.md](docs/ps5.md#trueforce)).
+- PS5는 HID++를 쓰지 않으므로, 휠의 자체 설정(포스 피드백 세기, TRUEFORCE 세기,
+  댐핑 등)은 휠의 내장 프로파일을 따릅니다. 회전 범위는 게임이 정합니다. 휠을 내장
+  프로파일로 둔 상태에서 테스트했고, G HUB 모드는 테스트하지 않았습니다.
+- 호스트 포트는 풀스피드 장치만, 허브 하나 뒤에 최대 3개까지 지원합니다. 보드의 풀업
+  저항(R13) 때문에 허브를 먼저 꽂은 뒤 보드에 전원을 넣어야 합니다.
+- PIO 버스의 간헐적인 USB 오류(포스 피드백 중 초당 몇 번의 handshake 누락 등)는
+  재시도로 자동 복구됩니다. [docs/usb-host.md](docs/usb-host.md#known-issues)를
+  참고하세요.
 
 ### 문서
 
