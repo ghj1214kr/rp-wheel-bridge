@@ -581,7 +581,7 @@ async fn forward_ffb_out(bus: &HostBus, info: &EnumerationInfo, ep: &EndpointDes
 /// Force stream packets from the console carrying TRUEFORCE samples, per stats interval.
 static FFB_TRUEFORCE: AtomicU32 = AtomicU32::new(0);
 /// Byte 10 of a force packet: the number of new TRUEFORCE samples (mescon's
-/// TRUEFORCE_PROTOCOL.md). GT7 was seen sending 12-byte packets with none.
+/// TRUEFORCE_PROTOCOL.md). GT7 sends samples only with vibration on for controller 1.
 const FFB_TF_SAMPLES: usize = 10;
 
 fn carries_trueforce(data: &[u8]) -> bool {

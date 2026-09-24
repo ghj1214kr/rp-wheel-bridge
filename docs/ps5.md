@@ -39,8 +39,9 @@ IF2, report 0x01, in the G Pro's native format in both directions (force in byte
 6-9, as in the TrueForce driver's protocol notes), so it is forwarded unchanged.
 
 - Console → wheel (EP 0x02 on the c269): `01 00 00 00 <cmd> <seq> ...`.
-  - The packets are **cut short**: 12 bytes (6-16 during set-up), not 64. DriveHub
-    and the bridge pad them with zeros to 64 for the c272.
+  - The packets are **cut short**: 12 bytes (6-16 during set-up), not 64, unless
+    they carry TRUEFORCE samples (below). DriveHub and the bridge pad them with zeros
+    to 64 for the c272.
   - While driving, one command only, ~770 per second:
     `01 00 00 00 01 <seq> <F16> <F16>`, the same force twice, uint16 LE offset binary
     (0x8000 neutral).
@@ -77,12 +78,24 @@ TRUEFORCE rides on the same force packets: byte 10 is the number of new samples,
 byte 11 a valid flag (0x0d) and the samples follow from byte 12. The G Pro has no USB
 audio interface.
 
-GT7 sends the TRUEFORCE start-up commands (05, 07, 06, 0e, 04, 03 above) but, in
-every drive so far, only 12-byte force packets with byte 10 = 0: no samples. That did
-not change with the wheel's onboard TRUEFORCE level at 100 %, 50 % or 0 % (the wheel
-reports changes as HID++ `12 ff 17 10 <hi> <lo>`, which the PS5 does not read). The
-bridge counts force packets carrying samples in its 5 s statistics (`TF n`), so a
-game that sends them would show up.
+GT7 sends the TRUEFORCE start-up commands (05, 07, 06, 0e, 04, 03 above) in any
+case, but the samples only while **vibration is on for controller 1**. With it off,
+the force packets stay 12 bytes with byte 10 = 0. With it on, nearly every force
+packet is a full 64 bytes with 4-5 new samples, about 4000 samples per second:
+
+```text
+01 00 00 00 01 0f c5 80 c5 80 05 0d 1f 80 1f 80 23 80 23 80 28 80 ...
+               force       new valid  samples (u16 LE, duplicated) ...
+```
+
+Switching vibration on and off in a session starts and stops the samples. The
+bridge forwards them unchanged and counts the force packets carrying samples in
+its 5 s statistics (`TF n`).
+
+The wheel's onboard TRUEFORCE level reaches the console on IF2: status report type
+0x10 (`01 00 00 00 10 <seq> ...`) carries it in bytes 17-18, u16 LE (`ff ff` =
+100 %). The wheel also notifies changes as HID++ `12 ff 17 10 <hi> <lo>`, which the
+PS5 does not read.
 
 ## Behaviour worth knowing
 

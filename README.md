@@ -12,8 +12,8 @@ Written in pure Rust with [Embassy](https://embassy.dev); the USB host runs on t
 RP2350's PIO.
 
 Tested with Gran Turismo 7: the wheel is recognised as a G PRO, steering, pedals,
-buttons, force feedback and rev lights work, and authentication passes through a
-licensed controller.
+buttons, force feedback, TRUEFORCE and rev lights work, and authentication passes
+through a licensed controller.
 
 ### How it works
 
@@ -75,9 +75,8 @@ the hub can be plugged and unplugged freely.
 - Occasional USB errors on the PIO bus are recovered automatically. The wheel has
   been seen to drop out of force feedback a few times; see
   [docs/usb-host.md](docs/usb-host.md#known-issues).
-- TRUEFORCE: the force stream is forwarded as it is, but GT7 was not seen sending
-  any TRUEFORCE samples to the bridge, whatever the wheel's onboard TRUEFORCE level
-  ([docs/ps5.md](docs/ps5.md#trueforce)).
+- TRUEFORCE needs vibration switched on for controller 1: with it off, GT7 sends
+  force feedback without TRUEFORCE samples ([docs/ps5.md](docs/ps5.md#trueforce)).
 
 ### Documentation
 
@@ -105,7 +104,7 @@ PlayStation용 G PRO(046d:c269)로 쓸 수 있게 해 주는 RP2350 보드용 �
 PIO로 구현했습니다.
 
 그란 투리스모 7에서 테스트했습니다. 휠이 G PRO로 인식되고 조향, 페달, 버튼, 포스
-피드백, 레브 LED가 동작하며, 인증은 정품 라이선스 컨트롤러를 거쳐 통과합니다.
+피드백, TRUEFORCE, 레브 LED가 동작하며, 인증은 정품 라이선스 컨트롤러를 거쳐 통과합니다.
 
 ### 동작 방식
 
@@ -163,9 +162,8 @@ cargo run --release      # picotool load --update --verify --execute
 - PIO 버스의 간헐적인 USB 오류는 자동으로 복구됩니다. 휠이 포스 피드백에서 빠지는
   현상이 몇 번 있었습니다. [docs/usb-host.md](docs/usb-host.md#known-issues)를
   참고하세요.
-- TRUEFORCE: 포스 피드백 스트림은 그대로 전달하지만, GT7은 휠의 내장 TRUEFORCE
-  설정과 관계없이 TRUEFORCE 샘플을 보내지 않았습니다
-  ([docs/ps5.md](docs/ps5.md#trueforce)).
+- TRUEFORCE를 쓰려면 컨트롤러 1의 진동을 켜야 합니다. 꺼져 있으면 GT7은 TRUEFORCE
+  샘플 없이 포스 피드백만 보냅니다([docs/ps5.md](docs/ps5.md#trueforce)).
 
 ### 문서
 
